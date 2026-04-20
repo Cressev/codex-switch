@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Query Codex balance for one or more account auth files.
+
+Usage:
+  codex-balance-helper <name>:<path> [<name>:<path> ...]
+
+Each argument is "account_name:path_to_auth_json".
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+HTTP_TIMEOUT = 10.0
+
+RED = "\033[0;31m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+CYAN = "\033[0;36m"
+DIM = "\033[2m"
+NC = "\033[0m"
+
+
+@dataclass
+class WindowSummary:
+    name: str
+    used_percent: int | None
+    limit_window_seconds: int | None
+    reset_after_seconds: int | None
+    reset_at: int | None
+
+    @property
+    def remaining_percent(self) -> int | None:
+        if self.used_percent is None:
+            return None
+        return max(0, 100 - self.used_percent)
+
+
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "-"
+    seconds = max(0, seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs and not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts) if parts else "0m"
+
+
+def format_timestamp(ts: int | None) -> str:
+    if ts is None:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+
+def get_access_token(auth: dict[str, Any]) -> str | None:
+    tokens = auth.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    token = tokens.get("access_token")
+    if not isinstance(token, str) or not token:
+        return None
+    return token
+
+
+def fetch_usage(token: str) -> dict[str, Any] | None:
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "codex-usage/0.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return None
+        return None
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def parse_window(name: str, payload: Any) -> WindowSummary:
+    data = payload if isinstance(payload, dict) else {}
+    return WindowSummary(
+        name=name,
+        used_percent=_as_int(data.get("used_percent")),
+        limit_window_seconds=_as_int(data.get("limit_window_seconds")),
+        reset_after_seconds=_as_int(data.get("reset_after_seconds")),
+        reset_at=_as_int(data.get("reset_at")),
+    )
+
+
+def query_account(name: str, auth_path: str) -> None:
+    try:
+        with open(auth_path) as f:
+            auth = json.load(f)
+    except Exception as exc:
+        print(f"  {RED}✗ 读取认证文件失败: {exc}{NC}")
+        return
+
+    token = get_access_token(auth)
+    if token is None:
+        print(f"  {RED}✗ 无有效 access_token (可能登录已过期，请重新 codex login){NC}")
+        return
+
+    account_id = auth.get("tokens", {}).get("account_id", "?")
+    print(f"  {DIM}账号: {account_id}{NC}")
+
+    payload = fetch_usage(token)
+    if payload is None:
+        print(f"  {RED}✗ 查询失败 (登录可能已过期，请重新 codex login){NC}")
+        return
+
+    rate_limit = payload.get("rate_limit")
+    rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
+
+    primary = parse_window("5h", rate_limit.get("primary_window"))
+    secondary = parse_window("weekly", rate_limit.get("secondary_window"))
+
+    p_used = primary.used_percent
+    p_rem = primary.remaining_percent
+    s_used = secondary.used_percent
+    s_rem = secondary.remaining_percent
+
+    p_bar = make_bar(p_rem)
+    s_bar = make_bar(s_rem)
+
+    p_reset = format_duration(primary.reset_after_seconds)
+    p_at = format_timestamp(primary.reset_at)
+    s_reset = format_duration(secondary.reset_after_seconds)
+    s_at = format_timestamp(secondary.reset_at)
+
+    def color_for(pct: int | None) -> str:
+        if pct is None:
+            return NC
+        if pct >= 80:
+            return RED
+        if pct >= 50:
+            return YELLOW
+        return GREEN
+
+    print(f"  5h   {color_for(p_used)}{p_bar} {p_rem}%剩余{NC}  重置: {p_reset} ({p_at})")
+    print(f"  周   {color_for(s_used)}{s_bar} {s_rem}%剩余{NC}  重置: {s_reset} ({s_at})")
+
+    limit_reached = rate_limit.get("limit_reached")
+    if limit_reached:
+        print(f"  {RED}⚠ 额度已达上限{NC}")
+
+
+def make_bar(remaining_pct: int | None, width: int = 20) -> str:
+    if remaining_pct is None:
+        return "[" + "?" * width + "]"
+    rem_blocks = round(remaining_pct / 100 * width)
+    rem_blocks = min(max(rem_blocks, 0), width)
+    return "[" + "█" * rem_blocks + "░" * (width - rem_blocks) + "]"
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        print("用法: codex-balance-helper <name>:<path> [...]", file=sys.stderr)
+        return 1
+
+    for arg in args:
+        if ":" not in arg:
+            print(f"{RED}无效参数 (需 name:path 格式): {arg}{NC}", file=sys.stderr)
+            continue
+        name, path = arg.split(":", 1)
+        print(f"\n{CYAN}▸ {name}{NC}")
+        query_account(name, path)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
