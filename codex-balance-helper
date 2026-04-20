@@ -145,6 +145,35 @@ def query_account(name: str, auth_path: str) -> None:
         print(f"  {RED}✗ 查询失败 (登录可能已过期，请重新 codex login){NC}")
         return
 
+    plan_type = payload.get("plan_type", "unknown")
+    is_free = plan_type == "free"
+
+    def color_for(pct: int | None) -> str:
+        if pct is None:
+            return NC
+        if pct >= 80:
+            return RED
+        if pct >= 50:
+            return YELLOW
+        return GREEN
+
+    if is_free:
+        print(f"  {YELLOW}[免费计划]{NC}")
+        rate_limit = payload.get("rate_limit")
+        rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
+        primary = parse_window("main", rate_limit.get("primary_window"))
+        p_used = primary.used_percent
+        p_rem = primary.remaining_percent
+        p_bar = make_bar(p_rem)
+        p_reset = format_duration(primary.reset_after_seconds)
+        p_at = format_timestamp(primary.reset_at)
+        p_window = format_duration(primary.limit_window_seconds)
+        print(f"  {p_window}  {color_for(p_used)}{p_bar} {fmt_pct(p_rem)}剩余{NC}  重置: {p_reset} ({p_at})")
+        limit_reached = rate_limit.get("limit_reached")
+        if limit_reached:
+            print(f"  {RED}⚠ 额度已达上限{NC}")
+        return
+
     rate_limit = payload.get("rate_limit")
     rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
 
@@ -164,26 +193,23 @@ def query_account(name: str, auth_path: str) -> None:
     s_reset = format_duration(secondary.reset_after_seconds)
     s_at = format_timestamp(secondary.reset_at)
 
-    def color_for(pct: int | None) -> str:
-        if pct is None:
-            return NC
-        if pct >= 80:
-            return RED
-        if pct >= 50:
-            return YELLOW
-        return GREEN
-
-    print(f"  5h   {color_for(p_used)}{p_bar} {p_rem}%剩余{NC}  重置: {p_reset} ({p_at})")
-    print(f"  周   {color_for(s_used)}{s_bar} {s_rem}%剩余{NC}  重置: {s_reset} ({s_at})")
+    print(f"  5h   {color_for(p_used)}{p_bar} {fmt_pct(p_rem)}剩余{NC}  重置: {p_reset} ({p_at})")
+    print(f"  周   {color_for(s_used)}{s_bar} {fmt_pct(s_rem)}剩余{NC}  重置: {s_reset} ({s_at})")
 
     limit_reached = rate_limit.get("limit_reached")
     if limit_reached:
         print(f"  {RED}⚠ 额度已达上限{NC}")
 
 
+def fmt_pct(pct: int | None) -> str:
+    if pct is None:
+        return "??"
+    return f"{pct}%"
+
+
 def make_bar(remaining_pct: int | None, width: int = 20) -> str:
     if remaining_pct is None:
-        return "[" + "?" * width + "]"
+        return "[" + "·" * width + "]"
     rem_blocks = round(remaining_pct / 100 * width)
     rem_blocks = min(max(rem_blocks, 0), width)
     return "[" + "█" * rem_blocks + "░" * (width - rem_blocks) + "]"
