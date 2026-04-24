@@ -1,534 +1,721 @@
-#!/bin/bash
-# Codex CLI 多账号管理工具
-# 支持添加、删除、切换任意数量的 ChatGPT Plus 账号
+#!/usr/bin/env python3
+"""macOS-friendly Codex account switcher backed by Keychain."""
 
-set -e
+from __future__ import annotations
 
-# 配置文件路径
-CODEX_DIR="$HOME/.codex"
-AUTH_FILE="$CODEX_DIR/auth.json"
-ACCOUNTS_DIR="$CODEX_DIR/accounts"
-INDEX_FILE="$ACCOUNTS_DIR/index.json"
+import base64
+import json
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-# 创建账号存储目录
-mkdir -p "$ACCOUNTS_DIR"
+CODEX_DIR = Path.home() / ".codex"
+AUTH_FILE = CODEX_DIR / "auth.json"
+STATE_DIR = Path.home() / "Library" / "Application Support" / "codex-switch-mac"
+INDEX_FILE = STATE_DIR / "index.json"
+KEYCHAIN_SERVICE = "codex-switch-mac"
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+HTTP_TIMEOUT = 10.0
 
-# 初始化索引文件
-if [ ! -f "$INDEX_FILE" ]; then
-    echo '{"accounts": []}' > "$INDEX_FILE"
-fi
+RED = "\033[0;31m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+BLUE = "\033[0;34m"
+CYAN = "\033[0;36m"
+DIM = "\033[2m"
+NC = "\033[0m"
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
 
-# 打印使用说明
-show_usage() {
-    echo -e "${BLUE}Codex CLI 多账号管理工具${NC}"
-    echo ""
-    echo "用法: codex-switch <命令> [参数]"
-    echo ""
-    echo "命令:"
-    echo "  list, ls          列出所有已保存的账号"
-    echo "  switch, sw <name> 切换到指定账号"
-    echo "  add <name>        添加新账号 (自动引导登录)"
-    echo "  remove, rm <name> 删除账号"
-    echo "  rename <old> <new> 重命名账号"
-    echo "  update [name]     重新登录并更新账号认证 (不指定则更新当前)"
-    echo "  status            查看当前使用的账号"
-    echo "  balance, bal [name] 查询账号余额 (不指定则查询全部)"
-    echo "  help              显示此帮助信息"
-    echo ""
-    echo "示例:"
-    echo "  codex-switch list                  # 列出所有账号"
-    echo "  codex-switch switch work           # 切换到 work 账号"
-    echo "  codex-switch sw personal           # 简写形式"
-    echo "  codex-switch add backup            # 添加新账号 (自动登录)"
-    echo "  codex-switch remove old-account    # 删除账号"
-    echo "  codex-switch rename work main      # 重命名账号"
-    echo "  codex-switch update                # 更新当前账号认证"
-    echo "  codex-switch update work           # 更新指定账号认证"
-    echo "  codex-switch status                # 查看当前账号"
-    echo "  codex-switch balance               # 查询所有账号余额"
-    echo "  codex-switch bal work              # 查询指定账号余额"
-}
+@dataclass
+class WindowSummary:
+    used_percent: int | None
+    limit_window_seconds: int | None
+    reset_after_seconds: int | None
+    reset_at: int | None
 
-# 列出所有账号
-list_accounts() {
-    echo -e "${BLUE}已保存的账号:${NC}"
-    echo ""
+    @property
+    def remaining_percent(self) -> int | None:
+        if self.used_percent is None:
+            return None
+        return max(0, 100 - self.used_percent)
 
-    local accounts=$(jq -r '.accounts[] | "\(.name)|\(.account_id)|\(.last_added)"' "$INDEX_FILE" 2>/dev/null || echo "")
 
-    if [ -z "$accounts" ]; then
-        echo -e "${YELLOW}还没有保存任何账号${NC}"
-        echo ""
-        echo "运行以下命令添加账号："
-        echo "  codex-switch add <账号名称>"
+@dataclass
+class UsageFetchResult:
+    payload: dict[str, Any] | None
+    error_kind: str | None = None
+    error_message: str | None = None
+
+
+def ensure_state_dir() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not INDEX_FILE.exists():
+        INDEX_FILE.write_text(json.dumps({"accounts": []}, ensure_ascii=False, indent=2) + "\n")
+
+
+def read_index() -> dict[str, Any]:
+    ensure_state_dir()
+    try:
+        return json.loads(INDEX_FILE.read_text())
+    except Exception:
+        return {"accounts": []}
+
+
+def write_index(index: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    INDEX_FILE.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n")
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def fail(message: str, exit_code: int = 1) -> None:
+    print(f"{RED}{message}{NC}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def load_auth(path: Path = AUTH_FILE) -> dict[str, Any]:
+    if not path.exists():
+        fail(f"未找到认证文件: {path}\n请先运行 `codex login`。")
+    try:
+        return json.loads(path.read_text())
+    except Exception as exc:
+        fail(f"读取认证文件失败: {exc}")
+
+
+def write_auth(auth: dict[str, Any], path: Path = AUTH_FILE) -> None:
+    CODEX_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(auth, ensure_ascii=False, indent=2) + "\n")
+
+
+def get_account_id(auth: dict[str, Any]) -> str:
+    return str(auth.get("tokens", {}).get("account_id") or "")
+
+
+def get_access_token(auth: dict[str, Any]) -> str | None:
+    token = auth.get("tokens", {}).get("access_token")
+    if isinstance(token, str) and token:
+        return token
+    return None
+
+
+def decode_jwt_payload(token: str) -> dict[str, Any]:
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8")
+        obj = json.loads(decoded)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_current_account_id() -> str:
+    if not AUTH_FILE.exists():
+        return ""
+    try:
+        return get_account_id(load_auth())
+    except SystemExit:
+        return ""
+
+
+def get_last_refresh(auth: dict[str, Any]) -> str:
+    value = auth.get("last_refresh")
+    return value if isinstance(value, str) else ""
+
+
+def derive_default_name(auth: dict[str, Any]) -> str:
+    id_token = auth.get("tokens", {}).get("id_token")
+    if isinstance(id_token, str) and id_token:
+        email = decode_jwt_payload(id_token).get("email")
+        if isinstance(email, str) and "@" in email:
+            return email.split("@", 1)[0]
+    access_token = auth.get("tokens", {}).get("access_token")
+    if isinstance(access_token, str) and access_token:
+        profile = decode_jwt_payload(access_token).get("https://api.openai.com/profile", {})
+        if isinstance(profile, dict):
+            email = profile.get("email")
+            if isinstance(email, str) and "@" in email:
+                return email.split("@", 1)[0]
+    return get_account_id(auth)[:8] or "current"
+
+
+def get_email(auth: dict[str, Any]) -> str:
+    id_token = auth.get("tokens", {}).get("id_token")
+    if isinstance(id_token, str) and id_token:
+        email = decode_jwt_payload(id_token).get("email")
+        if isinstance(email, str) and email:
+            return email
+    access_token = auth.get("tokens", {}).get("access_token")
+    if isinstance(access_token, str) and access_token:
+        profile = decode_jwt_payload(access_token).get("https://api.openai.com/profile", {})
+        if isinstance(profile, dict):
+            email = profile.get("email")
+            if isinstance(email, str) and email:
+                return email
+    return ""
+
+
+def find_account(index: dict[str, Any], name: str) -> dict[str, Any] | None:
+    for account in index.get("accounts", []):
+        if account.get("name") == name:
+            return account
+    return None
+
+
+def find_account_by_id(index: dict[str, Any], account_id: str) -> dict[str, Any] | None:
+    for account in index.get("accounts", []):
+        if account.get("account_id") == account_id:
+            return account
+    return None
+
+
+def save_snapshot(name: str, auth: dict[str, Any]) -> str:
+    account_id = get_account_id(auth)
+    if not account_id:
+        fail("当前认证文件里没有有效的 account_id。")
+
+    encoded = base64.b64encode(
+        json.dumps(auth, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+
+    subprocess.run(
+        [
+            "security",
+            "add-generic-password",
+            "-U",
+            "-a",
+            name,
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-l",
+            f"Codex Switch Mac ({name})",
+            "-w",
+            encoded,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    index = read_index()
+    existing = find_account(index, name)
+    saved_at = now_utc()
+    entry = {
+        "name": name,
+        "account_id": account_id,
+        "saved_at": saved_at,
+    }
+    if existing:
+        existing.update(entry)
+    else:
+        index["accounts"].append(entry)
+        index["accounts"].sort(key=lambda item: item["name"])
+    write_index(index)
+    return account_id
+
+
+def resolve_save_name(auth: dict[str, Any], requested_name: str | None) -> str:
+    index = read_index()
+    account_id = get_account_id(auth)
+    existing = find_account_by_id(index, account_id)
+    if existing and isinstance(existing.get("name"), str):
+        return str(existing["name"])
+    if requested_name:
+        return requested_name
+    return derive_default_name(auth)
+
+
+def load_snapshot(name: str) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-a",
+                name,
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-w",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        fail(f"Keychain 中没有找到账号 `{name}`。")
+    try:
+        decoded = base64.b64decode(result.stdout.strip().encode("ascii"))
+        return json.loads(decoded.decode("utf-8"))
+    except Exception as exc:
+        fail(f"读取 Keychain 快照失败: {exc}")
+
+
+def delete_snapshot(name: str) -> None:
+    subprocess.run(
+        [
+            "security",
+            "delete-generic-password",
+            "-a",
+            name,
+            "-s",
+            KEYCHAIN_SERVICE,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def restore_previous_auth(previous_auth: dict[str, Any] | None) -> None:
+    if previous_auth is None:
         return
-    fi
+    write_auth(previous_auth)
 
-    # 获取当前账号 ID
-    local current_id=$(jq -r '.tokens.account_id // ""' "$AUTH_FILE" 2>/dev/null || echo "")
 
-    # 打印账号列表
-    local counter=1
-    while IFS='|' read -r name account_id last_added; do
-        if [ "$account_id" = "$current_id" ]; then
-            echo -e "${GREEN}✓ [${counter}] ${name}${NC} (当前)"
-        else
-            echo "  [${counter}] ${name}"
-        fi
-        echo "      账号 ID: ${account_id}"
-        echo "      添加时间: ${last_added}"
-        echo ""
-        ((counter++))
-    done <<< "$accounts"
-}
+def is_valid_auth(auth: dict[str, Any]) -> bool:
+    return bool(get_account_id(auth) and get_access_token(auth))
 
-# 检查当前账号
-check_status() {
-    if [ ! -f "$AUTH_FILE" ]; then
-        echo -e "${RED}错误: 未找到认证文件 $AUTH_FILE${NC}"
-        echo "请先运行 'codex login' 登录 Codex"
-        exit 1
-    fi
 
-    echo -e "${BLUE}当前账号信息:${NC}"
-    ACCOUNT_ID=$(jq -r '.tokens.account_id // "未知"' "$AUTH_FILE" 2>/dev/null || echo "未知")
-    AUTH_MODE=$(jq -r '.auth_mode // "未知"' "$AUTH_FILE" 2>/dev/null || echo "未知")
-    LAST_REFRESH=$(jq -r '.last_refresh // "未知"' "$AUTH_FILE" 2>/dev/null || echo "未知")
+def auth_changed(previous_auth: dict[str, Any] | None, current_auth: dict[str, Any]) -> bool:
+    if previous_auth is None:
+        return is_valid_auth(current_auth)
+    return (
+        get_account_id(previous_auth) != get_account_id(current_auth)
+        or get_last_refresh(previous_auth) != get_last_refresh(current_auth)
+    )
 
-    echo "账号 ID: $ACCOUNT_ID"
-    echo "认证模式: $AUTH_MODE"
-    echo "最后刷新: $LAST_REFRESH"
 
-    # 查找对应的账号名称
-    local name=$(jq -r --arg id "$ACCOUNT_ID" '.accounts[] | select(.account_id == $id) | .name' "$INDEX_FILE" 2>/dev/null || echo "")
-    
-    if [ -n "$name" ]; then
-        echo -e "${GREEN}当前使用: ${name}${NC}"
-    else
-        echo -e "${YELLOW}注意: 当前配置不在已保存的账号列表中${NC}"
-    fi
-}
+def run_codex_login() -> dict[str, Any]:
+    if not command_exists("codex"):
+        fail("未找到 `codex` 命令。请先确认 Codex CLI 已安装。")
+    print(f"{CYAN}将启动 `codex login`，请在浏览器里完成登录。{NC}")
+    previous_auth = load_auth() if AUTH_FILE.exists() else None
+    result = subprocess.run(["codex", "login"])
+    current_auth = load_auth() if AUTH_FILE.exists() else {}
 
-# 添加新账号
-add_account() {
-    local name=$1
+    if result.returncode == 0:
+        if not is_valid_auth(current_auth):
+            fail("`codex login` 已完成，但认证文件不完整。")
+        return current_auth
 
-    if [ -z "$name" ]; then
-        echo -e "${RED}错误: 请提供账号名称${NC}"
-        echo "用法: codex-switch add <账号名称>"
-        exit 1
-    fi
+    # Codex CLI 的浏览器登录偶发会在 token exchange 阶段报错，但 auth.json 已更新。
+    if current_auth and is_valid_auth(current_auth) and auth_changed(previous_auth, current_auth):
+        print(f"{YELLOW}检测到 `codex login` 返回了错误，但认证文件已经更新，继续使用新登录状态。{NC}")
+        return current_auth
 
-    # 检查名称是否已存在
-    if jq -e --arg name "$name" '.accounts[] | select(.name == $name)' "$INDEX_FILE" &>/dev/null; then
-        echo -e "${YELLOW}账号名称 '$name' 已存在${NC}"
-        echo "请选择操作:"
-        echo "  1) 更新该账号的认证 (update)"
-        echo "  2) 换一个名称"
-        echo "  3) 取消"
-        echo -n "请输入 (1/2/3): "
-        read -r choice
-        case "$choice" in
-            1)
-                update_account "$name"
-                return
-                ;;
-            2)
-                echo -n "请输入新名称: "
-                read -r new_name
-                if [ -z "$new_name" ]; then
-                    echo "已取消"
-                    exit 0
-                fi
-                if jq -e --arg name "$new_name" '.accounts[] | select(.name == $name)' "$INDEX_FILE" &>/dev/null; then
-                    echo -e "${RED}名称 '$new_name' 也已存在，已取消${NC}"
-                    exit 1
-                fi
-                name="$new_name"
-                ;;
-            *)
-                echo "已取消"
-                exit 0
-                ;;
-        esac
-    fi
+    fail(
+        "`codex login` 没有完成，而且认证文件也没有更新。\n"
+        "如果你刚才看到的是 `token exchange failed`、`tls handshake eof`、"
+        "或 `error sending request for url (https://chatgpt.com/...)`，"
+        "根因通常是当前命令行到 chatgpt.com 的网络/TLS 不稳定，不是账号保存逻辑本身。\n"
+        "可先单独运行 `codex login`，成功后再执行 `codex-switch save <name>`。"
+    )
 
-    # 备份当前 auth.json
-    local temp_backup="$ACCOUNTS_DIR/.temp_add_backup.json"
-    if [ -f "$AUTH_FILE" ]; then
-        cp "$AUTH_FILE" "$temp_backup"
-    fi
 
-    # 运行 codex login
-    echo -e "${CYAN}正在启动登录流程，请在浏览器中完成登录...${NC}"
-    echo ""
-    if ! codex login; then
-        # 登录失败，恢复备份
-        if [ -f "$temp_backup" ]; then
-            cp "$temp_backup" "$AUTH_FILE"
-        fi
-        rm -f "$temp_backup"
-        echo -e "${RED}✗ 登录失败${NC}"
-        exit 1
-    fi
+def cmd_help() -> None:
+    print(f"{BLUE}codex-switch (macOS){NC}")
+    print("")
+    print("用法: codex-switch <命令> [参数]")
+    print("")
+    print("命令:")
+    print("  list, ls              列出已保存账号")
+    print("  status                查看当前 auth.json 对应的账号")
+    print("  save                  保存当前已登录账号到 Keychain")
+    print("  add <name>            登录一个新账号并保存，然后恢复当前登录")
+    print("  switch, sw <name>     切换到指定账号")
+    print("  update [name]         重新登录并更新指定账号")
+    print("  remove, rm <name>     删除账号")
+    print("  rename <old> <new>    重命名账号")
+    print("  balance, bal [name]   查询额度")
+    print("  help                  显示帮助")
+    print("")
+    print("示例:")
+    print("  codex-switch save")
+    print("  codex-switch add work")
+    print("  codex-switch switch work")
+    print("  codex-switch balance")
 
-    # 获取登录后的账号信息
-    local account_id=$(jq -r '.tokens.account_id // ""' "$AUTH_FILE" 2>/dev/null || echo "")
-    if [ -z "$account_id" ]; then
-        # 恢复备份
-        if [ -f "$temp_backup" ]; then
-            cp "$temp_backup" "$AUTH_FILE"
-        fi
-        rm -f "$temp_backup"
-        echo -e "${RED}✗ 无法获取登录账号信息${NC}"
-        exit 1
-    fi
 
-    # 检查账号 ID 是否已被其他名称保存
-    local existing_name=$(jq -r --arg id "$account_id" '.accounts[] | select(.account_id == $id) | .name' "$INDEX_FILE" 2>/dev/null || echo "")
-    if [ -n "$existing_name" ] && [ "$existing_name" != "$name" ]; then
-        echo -e "${YELLOW}警告: 该账号已以名称 '$existing_name' 保存${NC}"
-        echo -n "是否继续以新名称 '$name' 保存? (y/n): "
-        read -r reply
-        if [[ ! $reply =~ ^[Yy]$ ]]; then
-            # 恢复备份
-            if [ -f "$temp_backup" ]; then
-                cp "$temp_backup" "$AUTH_FILE"
-            fi
-            rm -f "$temp_backup"
-            echo "已取消"
-            exit 0
-        fi
-    fi
+def cmd_list() -> None:
+    index = read_index()
+    accounts = index.get("accounts", [])
+    if not accounts:
+        print(f"{YELLOW}还没有保存任何账号。{NC}")
+        print("先运行 `codex-switch save <name>` 或 `codex-switch add <name>`。")
+        return
 
-    # 保存账号文件
-    local account_file="$ACCOUNTS_DIR/${name}.json"
-    cp "$AUTH_FILE" "$account_file"
+    current_id = get_current_account_id()
+    print(f"{BLUE}已保存账号{NC}")
+    print("")
+    for account in accounts:
+        marker = f"{GREEN}*{NC}" if account.get("account_id") == current_id else " "
+        email = ""
+        try:
+            email = get_email(load_snapshot(str(account.get("name"))))
+        except SystemExit:
+            email = ""
+        print(f"{marker} {YELLOW}{account.get('name')}{NC}")
+        if email:
+            print(f"    email:      {email}")
+        print(f"    account_id: {account.get('account_id')}")
+        print(f"    saved_at:   {account.get('saved_at')}")
+        print("")
 
-    # 添加到索引
-    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    jq --arg name "$name" \
-       --arg id "$account_id" \
-       --arg time "$timestamp" \
-       '.accounts += [{"name": $name, "account_id": $id, "last_added": $time}]' \
-       "$INDEX_FILE" > "${INDEX_FILE}.tmp" && mv "${INDEX_FILE}.tmp" "$INDEX_FILE"
 
-    # 恢复之前的登录状态
-    if [ -f "$temp_backup" ]; then
-        cp "$temp_backup" "$AUTH_FILE"
-        rm -f "$temp_backup"
-    fi
+def cmd_status() -> None:
+    auth = load_auth()
+    account_id = get_account_id(auth) or "未知"
+    auth_mode = auth.get("auth_mode") or "未知"
+    email = get_email(auth) or "未知"
+    index = read_index()
+    known = find_account_by_id(index, account_id)
 
-    echo -e "${GREEN}✓ 已添加账号: ${name}${NC}"
-    echo "账号 ID: $account_id"
-    echo ""
-    echo "现在可以运行以下命令切换账号："
-    echo "  codex-switch switch $name"
-}
+    print(f"{BLUE}当前认证状态{NC}")
+    if known:
+        print(f"name:       {YELLOW}{known.get('name')}{NC}")
+    print(f"email:      {email}")
+    print(f"account_id: {account_id}")
+    print(f"auth_mode:  {auth_mode}")
+    if known:
+        print("saved:      yes")
+    else:
+        print(f"saved:      {YELLOW}no{NC}")
 
-# 切换账号
-switch_account() {
-    local name=$1
 
-    if [ -z "$name" ]; then
-        echo -e "${RED}错误: 请提供账号名称${NC}"
-        echo "用法: codex-switch switch <账号名称>"
-        echo ""
-        echo "可用账号列表："
-        list_accounts
-        exit 1
-    fi
+def cmd_save(name: str) -> None:
+    auth = load_auth()
+    name = resolve_save_name(auth, name or None)
+    account_id = save_snapshot(name, auth)
+    print(f"{GREEN}已保存账号 `{name}`。{NC}")
+    print(f"account_id: {account_id}")
 
-    local account_file="$ACCOUNTS_DIR/${name}.json"
 
-    if [ ! -f "$account_file" ]; then
-        echo -e "${RED}错误: 账号 '$name' 不存在${NC}"
-        echo ""
-        echo "可用账号列表："
-        list_accounts
-        exit 1
-    fi
+def cmd_add(name: str) -> None:
+    if not name:
+        fail("用法: codex-switch add <name>")
+    previous_auth = load_auth() if AUTH_FILE.exists() else None
+    try:
+        new_auth = run_codex_login()
+        account_id = save_snapshot(name, new_auth)
+    finally:
+        restore_previous_auth(previous_auth)
+    print(f"{GREEN}已添加账号 `{name}`。{NC}")
+    print(f"account_id: {account_id}")
+    if previous_auth is not None:
+        print("当前登录状态已恢复。")
 
-    # 备份当前配置
-    local backup_file="$ACCOUNTS_DIR/backup_$(date +%Y%m%d_%H%M%S).json"
-    if [ -f "$AUTH_FILE" ]; then
-        cp "$AUTH_FILE" "$backup_file"
-        echo -e "${YELLOW}已备份当前配置到: $backup_file${NC}"
-    fi
 
-    # 切换到指定账号
-    cp "$account_file" "$AUTH_FILE"
+def cmd_switch(name: str) -> None:
+    if not name:
+        fail("用法: codex-switch switch <name>")
+    auth = load_snapshot(name)
+    write_auth(auth)
+    print(f"{GREEN}已切换到 `{name}`。{NC}")
+    print(f"account_id: {get_account_id(auth)}")
 
-    # 获取账号信息
-    local account_id=$(jq -r '.tokens.account_id' "$AUTH_FILE" 2>/dev/null || echo "")
 
-    echo -e "${GREEN}✓ 已切换到账号: ${name}${NC}"
-    echo "账号 ID: $account_id"
-    echo ""
-    echo -e "${BLUE}现在可以开始使用 Codex CLI 了！${NC}"
-}
+def cmd_remove(name: str) -> None:
+    if not name:
+        fail("用法: codex-switch remove <name>")
+    index = read_index()
+    if not find_account(index, name):
+        fail(f"账号 `{name}` 不存在。")
+    delete_snapshot(name)
+    index["accounts"] = [item for item in index.get("accounts", []) if item.get("name") != name]
+    write_index(index)
+    print(f"{GREEN}已删除账号 `{name}`。{NC}")
 
-# 删除账号
-remove_account() {
-    local name=$1
 
-    if [ -z "$name" ]; then
-        echo -e "${RED}错误: 请提供账号名称${NC}"
-        echo "用法: codex-switch remove <账号名称>"
-        echo ""
-        echo "可用账号列表："
-        list_accounts
-        exit 1
-    fi
+def cmd_rename(old_name: str, new_name: str) -> None:
+    if not old_name or not new_name:
+        fail("用法: codex-switch rename <old> <new>")
+    index = read_index()
+    account = find_account(index, old_name)
+    if not account:
+        fail(f"账号 `{old_name}` 不存在。")
+    if find_account(index, new_name):
+        fail(f"账号 `{new_name}` 已存在。")
+    auth = load_snapshot(old_name)
+    save_snapshot(new_name, auth)
+    delete_snapshot(old_name)
+    index = read_index()
+    index["accounts"] = [item for item in index.get("accounts", []) if item.get("name") != old_name]
+    write_index(index)
+    print(f"{GREEN}已重命名 `{old_name}` -> `{new_name}`。{NC}")
 
-    # 检查账号是否存在
-    if ! jq -e --arg name "$name" '.accounts[] | select(.name == $name)' "$INDEX_FILE" &>/dev/null; then
-        echo -e "${RED}错误: 账号 '$name' 不存在${NC}"
-        echo ""
-        echo "可用账号列表："
-        list_accounts
-        exit 1
-    fi
 
-    # 确认删除
-    echo -e "${YELLOW}警告: 即将删除账号 '$name'${NC}"
-    echo "这个操作不可撤销！"
-    echo -n "确认删除? (yes/no): "
-    read -r confirmation
+def cmd_update(name: str | None) -> None:
+    index = read_index()
+    if not name:
+        current_id = get_current_account_id()
+        current = find_account_by_id(index, current_id)
+        if not current:
+            fail("当前账号不在已保存列表中。请显式传入账号名。")
+        name = str(current["name"])
 
-    if [ "$confirmation" != "yes" ]; then
-        echo "已取消"
-        exit 0
-    fi
+    if not find_account(index, name):
+        fail(f"账号 `{name}` 不存在。")
 
-    # 删除账号文件
-    local account_file="$ACCOUNTS_DIR/${name}.json"
-    rm -f "$account_file"
+    previous_auth = load_auth() if AUTH_FILE.exists() else None
+    try:
+        write_auth(load_snapshot(name))
+        updated_auth = run_codex_login()
+        account_id = save_snapshot(name, updated_auth)
+    finally:
+        restore_previous_auth(previous_auth)
+    print(f"{GREEN}已更新账号 `{name}`。{NC}")
+    print(f"account_id: {account_id}")
+    if previous_auth is not None:
+        print("当前登录状态已恢复。")
 
-    # 从索引中删除
-    jq --arg name "$name" 'del(.accounts[] | select(.name == $name))' \
-       "$INDEX_FILE" > "${INDEX_FILE}.tmp" && mv "${INDEX_FILE}.tmp" "$INDEX_FILE"
 
-    echo -e "${GREEN}✓ 已删除账号: ${name}${NC}"
-}
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
 
-# 重命名账号
-rename_account() {
-    local old_name=$1
-    local new_name=$2
 
-    if [ -z "$old_name" ] || [ -z "$new_name" ]; then
-        echo -e "${RED}错误: 请提供旧名称和新名称${NC}"
-        echo "用法: codex-switch rename <旧名称> <新名称>"
-        exit 1
-    fi
+def parse_window(payload: Any) -> WindowSummary:
+    data = payload if isinstance(payload, dict) else {}
+    return WindowSummary(
+        used_percent=_as_int(data.get("used_percent")),
+        limit_window_seconds=_as_int(data.get("limit_window_seconds")),
+        reset_after_seconds=_as_int(data.get("reset_after_seconds")),
+        reset_at=_as_int(data.get("reset_at")),
+    )
 
-    # 检查旧名称是否存在
-    if ! jq -e --arg name "$old_name" '.accounts[] | select(.name == $name)' "$INDEX_FILE" &>/dev/null; then
-        echo -e "${RED}错误: 账号 '$old_name' 不存在${NC}"
-        echo ""
-        echo "可用账号列表："
-        list_accounts
-        exit 1
-    fi
 
-    # 检查新名称是否已存在
-    if jq -e --arg name "$new_name" '.accounts[] | select(.name == $name)' "$INDEX_FILE" &>/dev/null; then
-        echo -e "${RED}错误: 账号名称 '$new_name' 已存在${NC}"
-        exit 1
-    fi
+def fmt_pct(pct: int | None) -> str:
+    return "??%" if pct is None else f"{pct}%"
 
-    # 重命名文件
-    local old_file="$ACCOUNTS_DIR/${old_name}.json"
-    local new_file="$ACCOUNTS_DIR/${new_name}.json"
-    mv "$old_file" "$new_file"
 
-    # 更新索引
-    jq --arg old "$old_name" --arg new "$new_name" \
-       '(.accounts[] | select(.name == $old)).name = $new' \
-       "$INDEX_FILE" > "${INDEX_FILE}.tmp" && mv "${INDEX_FILE}.tmp" "$INDEX_FILE"
+def make_bar(remaining_pct: int | None, width: int = 20) -> str:
+    if remaining_pct is None:
+        return "[" + "·" * width + "]"
+    filled = round(remaining_pct / 100 * width)
+    filled = min(max(filled, 0), width)
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
 
-    echo -e "${GREEN}✓ 已重命名: ${old_name} → ${new_name}${NC}"
-}
 
-# 查询账号余额
-check_balance() {
-    local name=$1
+def format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "-"
+    seconds = max(0, seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs and not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts) if parts else "0m"
 
-    if [ -n "$name" ]; then
-        local account_file="$ACCOUNTS_DIR/${name}.json"
-        if [ ! -f "$account_file" ]; then
-            echo -e "${RED}错误: 账号 '$name' 不存在${NC}"
-            echo ""
-            echo "可用账号列表："
-            list_accounts
-            exit 1
-        fi
-        echo -e "${BLUE}═══════════════════════════════════════${NC}"
-        echo -e "${BLUE}查询余额: ${name}${NC}"
-        echo -e "${BLUE}═══════════════════════════════════════${NC}"
-        codex-balance-helper "${name}:${account_file}"
-    else
-        local accounts=$(jq -r '.accounts[] | "\(.name)|\(.account_id)"' "$INDEX_FILE" 2>/dev/null || echo "")
 
-        if [ -z "$accounts" ]; then
-            echo -e "${YELLOW}还没有保存任何账号${NC}"
-            exit 0
-        fi
+def format_timestamp(ts: int | None) -> str:
+    if ts is None:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
 
-        echo -e "${BLUE}═══════════════════════════════════════${NC}"
-        echo -e "${BLUE}查询所有账号余额${NC}"
-        echo -e "${BLUE}═══════════════════════════════════════${NC}"
 
-        local helper_args=""
-        while IFS='|' read -r acct_name acct_id; do
-            local acct_file="$ACCOUNTS_DIR/${acct_name}.json"
-            if [ -f "$acct_file" ]; then
-                helper_args="$helper_args ${acct_name}:${acct_file}"
-            else
-                echo -e "\n${CYAN}▸ ${acct_name}${NC}"
-                echo -e "  ${RED}✗ 认证文件不存在${NC}"
-            fi
-        done <<< "$accounts"
+def fetch_usage(token: str) -> UsageFetchResult:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        req = urllib.request.Request(
+            USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": "codex-switch-mac/0.1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                return UsageFetchResult(payload=payload)
+            return UsageFetchResult(
+                payload=None,
+                error_kind="invalid_response",
+                error_message="返回数据不是预期的 JSON 对象。",
+            )
+        except urllib.error.HTTPError as exc:
+            # 401/403 基本可视为登录无效，其他错误先重试一次。
+            if exc.code in (401, 403):
+                return UsageFetchResult(
+                    payload=None,
+                    error_kind="auth",
+                    error_message=f"HTTP {exc.code}，当前 access token 很可能已失效。",
+                )
+            last_error = exc
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+        if attempt == 0:
+            time.sleep(0.6)
+    if isinstance(last_error, urllib.error.URLError):
+        reason = str(last_error.reason)
+        if "SSLEOFError" in reason or "EOF occurred in violation of protocol" in reason:
+            return UsageFetchResult(
+                payload=None,
+                error_kind="network_tls",
+                error_message="命令行到 chatgpt.com 的 TLS 握手失败。",
+            )
+        return UsageFetchResult(
+            payload=None,
+            error_kind="network",
+            error_message=f"网络请求失败: {reason}",
+        )
+    if isinstance(last_error, TimeoutError):
+        return UsageFetchResult(
+            payload=None,
+            error_kind="timeout",
+            error_message="请求 chatgpt.com 超时。",
+        )
+    if isinstance(last_error, json.JSONDecodeError):
+        return UsageFetchResult(
+            payload=None,
+            error_kind="invalid_response",
+            error_message="响应不是有效 JSON。",
+        )
+    if last_error is not None:
+        return UsageFetchResult(
+            payload=None,
+            error_kind="unknown",
+            error_message=str(last_error),
+        )
+    return UsageFetchResult(payload=None, error_kind="unknown", error_message="未知错误。")
 
-        if [ -n "$helper_args" ]; then
-            codex-balance-helper $helper_args
-        fi
-    fi
 
-    echo ""
-    echo -e "${BLUE}═══════════════════════════════════════${NC}"
-}
+def print_usage_for_auth(name: str, auth: dict[str, Any]) -> None:
+    token = get_access_token(auth)
+    print(f"\n{CYAN}▸ {name}{NC}")
+    if not token:
+        print(f"  {RED}无有效 access_token，可能需要重新登录。{NC}")
+        return
 
-# 更新账号认证
-update_account() {
-    local name=$1
+    result = fetch_usage(token)
+    if result.payload is None:
+        if result.error_kind == "auth":
+            print(f"  {RED}查询失败：当前登录已失效，需要重新登录。{NC}")
+        elif result.error_kind in {"network_tls", "network", "timeout"}:
+            print(f"  {YELLOW}查询失败：{result.error_message}{NC}")
+            print(f"  {DIM}这更像是当前命令行到 chatgpt.com 的网络问题，不一定是账号失效。{NC}")
+        else:
+            print(f"  {RED}查询失败：{result.error_message or '未知错误'}{NC}")
+        return
 
-    # 如果没指定账号名，自动检测当前账号
-    if [ -z "$name" ]; then
-        if [ ! -f "$AUTH_FILE" ]; then
-            echo -e "${RED}错误: 当前未登录，请指定要更新的账号名称${NC}"
-            echo "用法: codex-switch update <账号名称>"
-            exit 1
-        fi
-        local current_id=$(jq -r '.tokens.account_id // ""' "$AUTH_FILE" 2>/dev/null || echo "")
-        name=$(jq -r --arg id "$current_id" '.accounts[] | select(.account_id == $id) | .name' "$INDEX_FILE" 2>/dev/null || echo "")
-        if [ -z "$name" ]; then
-            echo -e "${YELLOW}当前账号不在已保存列表中，请指定要更新的账号名称${NC}"
-            echo "用法: codex-switch update <账号名称>"
-            exit 1
-        fi
-        echo -e "${CYAN}检测到当前账号: ${name}${NC}"
-    fi
+    payload = result.payload
+    rate_limit = payload.get("rate_limit")
+    rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
+    primary = parse_window(rate_limit.get("primary_window"))
+    secondary = parse_window(rate_limit.get("secondary_window"))
 
-    # 检查账号是否存在
-    local account_file="$ACCOUNTS_DIR/${name}.json"
-    if [ ! -f "$account_file" ]; then
-        echo -e "${RED}错误: 账号 '$name' 不存在${NC}"
-        echo ""
-        echo "可用账号列表："
-        list_accounts
-        exit 1
-    fi
+    def color_for(used_percent: int | None) -> str:
+        if used_percent is None:
+            return NC
+        if used_percent >= 80:
+            return RED
+        if used_percent >= 50:
+            return YELLOW
+        return GREEN
 
-    # 备份当前 auth.json
-    local temp_backup="$ACCOUNTS_DIR/.temp_update_backup.json"
-    if [ -f "$AUTH_FILE" ]; then
-        cp "$AUTH_FILE" "$temp_backup"
-    fi
+    if secondary.used_percent is None and primary.used_percent is not None:
+        print(
+            f"  main  {color_for(primary.used_percent)}{make_bar(primary.remaining_percent)} "
+            f"{fmt_pct(primary.remaining_percent)}剩余{NC}  重置: "
+            f"{format_duration(primary.reset_after_seconds)} ({format_timestamp(primary.reset_at)})"
+        )
+        return
 
-    # 先切换到要更新的账号
-    cp "$account_file" "$AUTH_FILE"
+    print(
+        f"  5h    {color_for(primary.used_percent)}{make_bar(primary.remaining_percent)} "
+        f"{fmt_pct(primary.remaining_percent)}剩余{NC}  重置: "
+        f"{format_duration(primary.reset_after_seconds)} ({format_timestamp(primary.reset_at)})"
+    )
+    print(
+        f"  week  {color_for(secondary.used_percent)}{make_bar(secondary.remaining_percent)} "
+        f"{fmt_pct(secondary.remaining_percent)}剩余{NC}  重置: "
+        f"{format_duration(secondary.reset_after_seconds)} ({format_timestamp(secondary.reset_at)})"
+    )
 
-    # 运行 codex login 重新认证
-    echo -e "${CYAN}正在为账号 '${name}' 重新登录，请在浏览器中完成登录...${NC}"
-    echo ""
-    if ! codex login; then
-        # 登录失败，恢复备份
-        if [ -f "$temp_backup" ]; then
-            cp "$temp_backup" "$AUTH_FILE"
-        fi
-        rm -f "$temp_backup"
-        echo -e "${RED}✗ 登录失败${NC}"
-        exit 1
-    fi
 
-    # 获取更新后的账号信息
-    local account_id=$(jq -r '.tokens.account_id // ""' "$AUTH_FILE" 2>/dev/null || echo "")
-    if [ -z "$account_id" ]; then
-        if [ -f "$temp_backup" ]; then
-            cp "$temp_backup" "$AUTH_FILE"
-        fi
-        rm -f "$temp_backup"
-        echo -e "${RED}✗ 无法获取登录账号信息${NC}"
-        exit 1
-    fi
+def cmd_balance(name: str | None) -> None:
+    index = read_index()
+    if name:
+        account = find_account(index, name)
+        if not account:
+            fail(f"账号 `{name}` 不存在。")
+        print_usage_for_auth(name, load_snapshot(name))
+        return
 
-    # 保存更新后的认证信息到账号文件
-    cp "$AUTH_FILE" "$account_file"
+    accounts = index.get("accounts", [])
+    if not accounts:
+        print(f"{YELLOW}还没有保存任何账号。{NC}")
+        return
+    for account in accounts:
+        print_usage_for_auth(str(account["name"]), load_snapshot(str(account["name"])))
 
-    # 更新索引中的时间戳
-    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    jq --arg name "$name" --arg time "$timestamp" \
-       '(.accounts[] | select(.name == $name)).last_added = $time' \
-       "$INDEX_FILE" > "${INDEX_FILE}.tmp" && mv "${INDEX_FILE}.tmp" "$INDEX_FILE"
 
-    # 恢复之前的登录状态
-    if [ -f "$temp_backup" ]; then
-        cp "$temp_backup" "$AUTH_FILE"
-        rm -f "$temp_backup"
-    fi
+def main(argv: list[str]) -> int:
+    ensure_state_dir()
+    command = argv[1] if len(argv) > 1 else "help"
+    arg1 = argv[2] if len(argv) > 2 else ""
+    arg2 = argv[3] if len(argv) > 3 else ""
 
-    echo -e "${GREEN}✓ 已更新账号: ${name}${NC}"
-    echo "账号 ID: $account_id"
-    echo "更新时间: $timestamp"
-}
+    try:
+        if command in {"help", "-h", "--help"}:
+            cmd_help()
+        elif command in {"list", "ls"}:
+            cmd_list()
+        elif command == "status":
+            cmd_status()
+        elif command == "save":
+            cmd_save(arg1)
+        elif command == "add":
+            cmd_add(arg1)
+        elif command in {"switch", "sw"}:
+            cmd_switch(arg1)
+        elif command == "update":
+            cmd_update(arg1 or None)
+        elif command in {"remove", "rm"}:
+            cmd_remove(arg1)
+        elif command == "rename":
+            cmd_rename(arg1, arg2)
+        elif command in {"balance", "bal"}:
+            cmd_balance(arg1 or None)
+        else:
+            fail(f"未知命令: {command}")
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else str(exc)
+        fail(f"命令执行失败: {stderr}")
+    return 0
 
-# 主逻辑
-command=${1:-help}
-arg1=${2:-""}
-arg2=${3:-""}
 
-case "$command" in
-    list|ls)
-        list_accounts
-        ;;
-    switch|sw)
-        switch_account "$arg1"
-        ;;
-    add)
-        add_account "$arg1"
-        ;;
-    remove|rm)
-        remove_account "$arg1"
-        ;;
-    rename)
-        rename_account "$arg1" "$arg2"
-        ;;
-    status)
-        check_status
-        ;;
-    balance|bal)
-        check_balance "$arg1"
-        ;;
-    update)
-        update_account "$arg1"
-        ;;
-    help|--help|-h|"")
-        show_usage
-        ;;
-    *)
-        echo -e "${RED}错误: 未知命令 '$command'${NC}"
-        echo ""
-        show_usage
-        exit 1
-        ;;
-esac
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
