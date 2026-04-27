@@ -5,11 +5,17 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import re
+import secrets
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,7 +28,14 @@ STATE_DIR = Path.home() / "Library" / "Application Support" / "codex-switch-mac"
 INDEX_FILE = STATE_DIR / "index.json"
 KEYCHAIN_SERVICE = "codex-switch-mac"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_HOST = "chatgpt.com"
+CODEX_PORT = 443
+CODEX_CLIENT_VERSION = "0.123.0"
+MODELS_PATH = f"/backend-api/codex/models?client_version={CODEX_CLIENT_VERSION}"
+RESPONSES_WS_PATH = "/backend-api/codex/responses"
+RESPONSES_COMPACT_PATH = "/backend-api/codex/responses/compact"
 HTTP_TIMEOUT = 10.0
+DOCTOR_TIMEOUT = 8.0
 
 RED = "\033[0;31m"
 GREEN = "\033[0;32m"
@@ -52,6 +65,34 @@ class UsageFetchResult:
     payload: dict[str, Any] | None
     error_kind: str | None = None
     error_message: str | None = None
+
+
+@dataclass
+class DiagnosticStep:
+    name: str
+    ok: bool
+    latency_ms: float | None = None
+    status: int | None = None
+    reason: str | None = None
+    detail: str | None = None
+    remote_ip: str | None = None
+
+
+@dataclass
+class ProxyInfo:
+    source: str
+    raw: str
+    scheme: str
+    host: str
+    port: int
+
+    def display(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.source}={self.scheme}://{host}:{self.port}"
+
+    def url(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.scheme}://{host}:{self.port}"
 
 
 def ensure_state_dir() -> None:
@@ -159,15 +200,26 @@ def get_email(auth: dict[str, Any]) -> str:
     id_token = auth.get("tokens", {}).get("id_token")
     if isinstance(id_token, str) and id_token:
         email = decode_jwt_payload(id_token).get("email")
-        if isinstance(email, str) and email:
+        if isinstance(email, str) and "@" in email:
             return email
     access_token = auth.get("tokens", {}).get("access_token")
     if isinstance(access_token, str) and access_token:
         profile = decode_jwt_payload(access_token).get("https://api.openai.com/profile", {})
         if isinstance(profile, dict):
             email = profile.get("email")
-            if isinstance(email, str) and email:
+            if isinstance(email, str) and "@" in email:
                 return email
+    return ""
+
+
+def get_plan_type(auth: dict[str, Any]) -> str:
+    access_token = auth.get("tokens", {}).get("access_token")
+    if isinstance(access_token, str) and access_token:
+        openai_auth = decode_jwt_payload(access_token).get("https://api.openai.com/auth", {})
+        if isinstance(openai_auth, dict):
+            plan = openai_auth.get("chatgpt_plan_type")
+            if isinstance(plan, str) and plan:
+                return plan
     return ""
 
 
@@ -230,15 +282,44 @@ def save_snapshot(name: str, auth: dict[str, Any]) -> str:
     return account_id
 
 
-def resolve_save_name(auth: dict[str, Any], requested_name: str | None) -> str:
-    index = read_index()
-    account_id = get_account_id(auth)
-    existing = find_account_by_id(index, account_id)
-    if existing and isinstance(existing.get("name"), str):
-        return str(existing["name"])
-    if requested_name:
-        return requested_name
-    return derive_default_name(auth)
+def prompt_existing_name_resolution(name: str) -> str:
+    while True:
+        print(f"{YELLOW}账号名 `{name}` 已存在。{NC}")
+        print("  [r] 覆盖现有账号")
+        print("  [n] 重新输入名称")
+        print("  [c] 取消")
+        try:
+            choice = input("选择 [r/n/c]: ").strip().lower()
+        except EOFError:
+            fail("名称已存在，且当前不是交互终端，无法继续。")
+        if choice in {"r", "replace"}:
+            return name
+        if choice in {"n", "new"}:
+            try:
+                new_name = input("新的账号名: ").strip()
+            except EOFError:
+                fail("未读取到新的账号名。")
+            if not new_name:
+                print(f"{YELLOW}账号名不能为空。{NC}")
+                continue
+            return new_name
+        if choice in {"c", "cancel"}:
+            fail("已取消。")
+        print(f"{YELLOW}无效输入，请输入 r、n 或 c。{NC}")
+
+
+def resolve_target_name(index: dict[str, Any], requested_name: str) -> str:
+    name = requested_name.strip()
+    if not name:
+        fail("账号名不能为空。")
+    while True:
+        existing = find_account(index, name)
+        if not existing:
+            return name
+        next_name = prompt_existing_name_resolution(name)
+        if next_name == name:
+            return name
+        name = next_name.strip()
 
 
 def load_snapshot(name: str) -> dict[str, Any]:
@@ -336,20 +417,22 @@ def cmd_help() -> None:
     print("命令:")
     print("  list, ls              列出已保存账号")
     print("  status                查看当前 auth.json 对应的账号")
-    print("  save                  保存当前已登录账号到 Keychain")
+    print("  save <name>           保存当前已登录账号到指定名称")
     print("  add <name>            登录一个新账号并保存，然后恢复当前登录")
     print("  switch, sw <name>     切换到指定账号")
     print("  update [name]         重新登录并更新指定账号")
     print("  remove, rm <name>     删除账号")
     print("  rename <old> <new>    重命名账号")
     print("  balance, bal [name]   查询额度")
+    print("  doctor, diag          检测 Codex / compact / usage 网络链路")
     print("  help                  显示帮助")
     print("")
     print("示例:")
-    print("  codex-switch save")
+    print("  codex-switch save work")
     print("  codex-switch add work")
     print("  codex-switch switch work")
     print("  codex-switch balance")
+    print("  codex-switch doctor")
 
 
 def cmd_list() -> None:
@@ -366,11 +449,16 @@ def cmd_list() -> None:
     for account in accounts:
         marker = f"{GREEN}*{NC}" if account.get("account_id") == current_id else " "
         email = ""
+        plan = ""
         try:
-            email = get_email(load_snapshot(str(account.get("name"))))
+            snap = load_snapshot(str(account.get("name")))
+            email = get_email(snap)
+            plan = get_plan_type(snap)
         except SystemExit:
-            email = ""
+            pass
         print(f"{marker} {YELLOW}{account.get('name')}{NC}")
+        if plan:
+            print(f"    plan:       {plan}")
         if email:
             print(f"    email:      {email}")
         print(f"    account_id: {account.get('account_id')}")
@@ -399,8 +487,11 @@ def cmd_status() -> None:
 
 
 def cmd_save(name: str) -> None:
+    if not name:
+        fail("用法: codex-switch save <name>")
     auth = load_auth()
-    name = resolve_save_name(auth, name or None)
+    index = read_index()
+    name = resolve_target_name(index, name)
     account_id = save_snapshot(name, auth)
     print(f"{GREEN}已保存账号 `{name}`。{NC}")
     print(f"account_id: {account_id}")
@@ -409,6 +500,8 @@ def cmd_save(name: str) -> None:
 def cmd_add(name: str) -> None:
     if not name:
         fail("用法: codex-switch add <name>")
+    index = read_index()
+    name = resolve_target_name(index, name)
     previous_auth = load_auth() if AUTH_FILE.exists() else None
     try:
         new_auth = run_codex_login()
@@ -430,16 +523,18 @@ def cmd_switch(name: str) -> None:
     print(f"account_id: {get_account_id(auth)}")
 
 
-def cmd_remove(name: str) -> None:
-    if not name:
-        fail("用法: codex-switch remove <name>")
+def cmd_remove(names: list[str]) -> None:
+    if not names:
+        fail("用法: codex-switch remove <name> [name ...]")
     index = read_index()
-    if not find_account(index, name):
-        fail(f"账号 `{name}` 不存在。")
-    delete_snapshot(name)
-    index["accounts"] = [item for item in index.get("accounts", []) if item.get("name") != name]
+    for name in names:
+        if not find_account(index, name):
+            fail(f"账号 `{name}` 不存在。")
+    for name in names:
+        delete_snapshot(name)
+        index["accounts"] = [item for item in index.get("accounts", []) if item.get("name") != name]
+        print(f"{GREEN}已删除账号 `{name}`。{NC}")
     write_index(index)
-    print(f"{GREEN}已删除账号 `{name}`。{NC}")
 
 
 def cmd_rename(old_name: str, new_name: str) -> None:
@@ -546,17 +641,19 @@ def format_timestamp(ts: int | None) -> str:
 
 def fetch_usage(token: str) -> UsageFetchResult:
     last_error: Exception | None = None
+    proxy = get_proxy_info()
+    opener = build_proxy_opener(proxy)
     for attempt in range(2):
         req = urllib.request.Request(
             USAGE_URL,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
-                "User-Agent": "codex-switch-mac/0.1",
+                "User-Agent": "codex-switch-mac/0.2",
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             if isinstance(payload, dict):
                 return UsageFetchResult(payload=payload)
@@ -612,9 +709,543 @@ def fetch_usage(token: str) -> UsageFetchResult:
     return UsageFetchResult(payload=None, error_kind="unknown", error_message="未知错误。")
 
 
-def print_usage_for_auth(name: str, auth: dict[str, Any]) -> None:
+def build_ssl_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.check_hostname = True
+    return context
+
+
+def parse_proxy_info(source: str, raw: str) -> ProxyInfo | None:
+    proxy_url = raw if "://" in raw else f"http://{raw}"
+    parsed = urllib.parse.urlsplit(proxy_url)
+    if not parsed.hostname:
+        return None
+    scheme = parsed.scheme.lower() or "http"
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return ProxyInfo(source=source, raw=raw, scheme=scheme, host=parsed.hostname, port=port)
+
+
+def proxy_port_is_open(proxy: ProxyInfo) -> bool:
+    try:
+        with socket.create_connection((proxy.host, proxy.port), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+def get_codex_wrapper_proxy() -> ProxyInfo | None:
+    codex_path = shutil.which("codex")
+    if not codex_path:
+        return None
+    path = Path(codex_path)
+    try:
+        text = path.read_text()
+    except Exception:
+        return None
+    if len(text) > 20000 or "exec" not in text:
+        return None
+
+    assignments: dict[str, str] = {}
+    for line in text.splitlines():
+        match = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.+?)\s*$", line)
+        if not match:
+            continue
+        key, value = match.groups()
+        value = value.strip().strip("'\"")
+        if value.startswith("$"):
+            value = assignments.get(value[1:], value)
+        assignments[key] = value
+
+    raw = (
+        assignments.get("HTTPS_PROXY")
+        or assignments.get("https_proxy")
+        or assignments.get("ALL_PROXY")
+        or assignments.get("all_proxy")
+        or assignments.get("CLASH_PROXY")
+    )
+    if not raw or raw.startswith("$"):
+        return None
+    proxy = parse_proxy_info("codex_wrapper", raw)
+    if proxy and proxy_port_is_open(proxy):
+        return proxy
+    return None
+
+
+def get_proxy_info() -> ProxyInfo | None:
+    for source in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        raw = os.environ.get(source)
+        if not raw:
+            continue
+        proxy = parse_proxy_info(source, raw)
+        if proxy:
+            return proxy
+    return get_codex_wrapper_proxy()
+
+
+def build_proxy_opener(proxy: ProxyInfo | None) -> urllib.request.OpenerDirector:
+    if proxy is None:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler(
+            {
+                "http": proxy.url(),
+                "https": proxy.url(),
+            }
+        )
+    )
+
+
+def read_http_headers(sock: socket.socket, *, limit: int = 8192) -> str:
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        chunk = sock.recv(1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if b"\r\n\r\n" in b"".join(chunks):
+            break
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def connect_to_codex(timeout: float) -> tuple[socket.socket, str]:
+    proxy = get_proxy_info()
+    if proxy is None:
+        return socket.create_connection((CODEX_HOST, CODEX_PORT), timeout=timeout), "direct"
+
+    if proxy.scheme not in {"http", "https"}:
+        raise OSError(f"unsupported proxy scheme for doctor: {proxy.scheme}")
+
+    raw_sock = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
+    raw_sock.settimeout(timeout)
+    sock: socket.socket = raw_sock
+    if proxy.scheme == "https":
+        sock = build_ssl_context().wrap_socket(raw_sock, server_hostname=proxy.host)
+        sock.settimeout(timeout)
+
+    authority = f"{CODEX_HOST}:{CODEX_PORT}"
+    request = (
+        f"CONNECT {authority} HTTP/1.1\r\n"
+        f"Host: {authority}\r\n"
+        "User-Agent: codex-switch-mac/0.2\r\n"
+        "Proxy-Connection: Keep-Alive\r\n"
+        "\r\n"
+    ).encode("ascii")
+    try:
+        sock.sendall(request)
+        raw_headers = read_http_headers(sock)
+        first_line = raw_headers.splitlines()[0] if raw_headers else ""
+        if " 200 " not in first_line:
+            raise OSError(f"proxy CONNECT failed: {first_line or 'empty response'}")
+        return sock, proxy.display()
+    except Exception:
+        sock.close()
+        raise
+
+
+def detect_cloudflare_challenge(text: str) -> bool:
+    lowered = text.lower()
+    markers = (
+        "enable javascript and cookies to continue",
+        "challenge-error-text",
+        "/cdn-cgi/challenge-platform/",
+        "__cf_chl_",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def redact_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"email", "user_id", "account_id"}:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = redact_json_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_json_value(item) for item in value]
+    return value
+
+
+def summarize_body(text: str, limit: int = 180) -> str:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        compact = " ".join(text.split())
+    else:
+        compact = json.dumps(redact_json_value(parsed), ensure_ascii=False, separators=(",", ":"))
+    return compact[:limit]
+
+
+def timed_step(name: str, fn) -> DiagnosticStep:
+    start = time.perf_counter()
+    try:
+        payload = fn()
+    except Exception as exc:
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        return DiagnosticStep(
+            name=name,
+            ok=False,
+            latency_ms=round(latency_ms, 1),
+            reason=type(exc).__name__,
+            detail=str(exc),
+        )
+
+    latency_ms = (time.perf_counter() - start) * 1000.0
+    payload.setdefault("name", name)
+    payload.setdefault("ok", True)
+    payload.setdefault("latency_ms", round(latency_ms, 1))
+    return DiagnosticStep(**payload)
+
+
+def diagnostic_dns() -> DiagnosticStep:
+    def run() -> dict[str, Any]:
+        infos = socket.getaddrinfo(CODEX_HOST, CODEX_PORT, type=socket.SOCK_STREAM)
+        ips = sorted({info[4][0] for info in infos})
+        return {
+            "detail": ", ".join(ips[:4]),
+            "remote_ip": ips[0] if ips else None,
+        }
+
+    return timed_step("dns", run)
+
+
+def diagnostic_tcp() -> DiagnosticStep:
+    def run() -> dict[str, Any]:
+        sock, transport = connect_to_codex(DOCTOR_TIMEOUT)
+        try:
+            return {"remote_ip": sock.getpeername()[0], "detail": transport}
+        finally:
+            sock.close()
+
+    return timed_step("tcp", run)
+
+
+def diagnostic_tls() -> DiagnosticStep:
+    context = build_ssl_context()
+
+    def run() -> dict[str, Any]:
+        raw_sock, transport = connect_to_codex(DOCTOR_TIMEOUT)
+        try:
+            with context.wrap_socket(raw_sock, server_hostname=CODEX_HOST) as tls_sock:
+                cert = tls_sock.getpeercert()
+                subject = dict(item[0] for item in cert.get("subject", [])) if cert else {}
+                return {
+                    "remote_ip": tls_sock.getpeername()[0],
+                    "detail": f"tls={tls_sock.version()} subject={subject.get('commonName', '?')} via {transport}",
+                }
+        except Exception:
+            raw_sock.close()
+            raise
+
+    return timed_step("tls", run)
+
+
+def make_https_headers(token: str | None) -> dict[str, str]:
+    headers = {
+        "Host": CODEX_HOST,
+        "User-Agent": "codex-switch-mac/0.2",
+        "Accept": "application/json, text/plain, */*",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def diagnostic_https(
+    name: str,
+    path: str,
+    token: str | None,
+    *,
+    method: str = "GET",
+    body: bytes | None = None,
+    ok_statuses: set[int] | None = None,
+) -> DiagnosticStep:
+    def run() -> dict[str, Any]:
+        proxy = get_proxy_info()
+        headers = make_https_headers(token)
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(
+            f"https://{CODEX_HOST}{path}",
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            resp = build_proxy_opener(proxy).open(req, timeout=DOCTOR_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            resp = exc
+        with resp:
+            data = resp.read(1024).decode("utf-8", errors="replace")
+            challenge = detect_cloudflare_challenge(data)
+            statuses = ok_statuses or set()
+            status = resp.status
+            ok = (status in statuses if statuses else 200 <= status < 500) and not challenge
+            detail = summarize_body(data)
+            if proxy is not None:
+                detail = f"via {proxy.display()} | {detail}"
+            return {
+                "ok": ok,
+                "status": status,
+                "reason": "cloudflare_challenge" if challenge else resp.reason,
+                "detail": detail,
+            }
+
+    return timed_step(name, run)
+
+
+def diagnostic_websocket(token: str | None) -> DiagnosticStep:
+    context = build_ssl_context()
+
+    def run() -> dict[str, Any]:
+        key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        lines = [
+            f"GET {RESPONSES_WS_PATH} HTTP/1.1",
+            f"Host: {CODEX_HOST}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Version: 13",
+            f"Sec-WebSocket-Key: {key}",
+            "Origin: https://chatgpt.com",
+            "User-Agent: codex-switch-mac/0.2",
+        ]
+        if token:
+            lines.append(f"Authorization: Bearer {token}")
+        lines.append("")
+        lines.append("")
+        request = "\r\n".join(lines).encode("ascii")
+
+        raw_sock, transport = connect_to_codex(DOCTOR_TIMEOUT)
+        try:
+            with context.wrap_socket(raw_sock, server_hostname=CODEX_HOST) as tls_sock:
+                tls_sock.settimeout(DOCTOR_TIMEOUT)
+                tls_sock.sendall(request)
+                raw = tls_sock.recv(4096).decode("utf-8", errors="replace")
+                first_line = raw.splitlines()[0] if raw else ""
+                status = None
+                reason = None
+                if first_line.startswith("HTTP/1.1 "):
+                    parts = first_line.split(" ", 2)
+                    if len(parts) >= 3:
+                        status = int(parts[1])
+                        reason = parts[2]
+                challenge = detect_cloudflare_challenge(raw)
+                detail = summarize_body(raw)
+                detail = f"via {transport} | {detail}"
+                return {
+                    "ok": bool(status) and status in {101, 400, 401, 403} and not challenge,
+                    "status": status,
+                    "reason": "cloudflare_challenge" if challenge else reason,
+                    "detail": detail,
+                    "remote_ip": tls_sock.getpeername()[0],
+                }
+        except Exception:
+            raw_sock.close()
+            raise
+
+    return timed_step("ws /backend-api/codex/responses", run)
+
+
+def get_route_summary(ip: str | None) -> str | None:
+    if not ip:
+        return None
+    if sys.platform != "darwin" and command_exists("ip"):
+        try:
+            result = subprocess.run(
+                ["ip", "route", "get", ip],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError:
+            return None
+        parts = result.stdout.split()
+        interface = None
+        gateway = None
+        if "dev" in parts and parts.index("dev") + 1 < len(parts):
+            interface = parts[parts.index("dev") + 1]
+        if "via" in parts and parts.index("via") + 1 < len(parts):
+            gateway = parts[parts.index("via") + 1]
+        if not interface:
+            return None
+        summary = interface
+        if gateway:
+            summary += f" via {gateway}"
+        return summary
+    try:
+        result = subprocess.run(
+            ["route", "-n", "get", ip],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    fields: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip()
+    interface = fields.get("interface")
+    gateway = fields.get("gateway")
+    if not interface:
+        return None
+    summary = interface
+    if gateway:
+        summary += f" via {gateway}"
+    return summary
+
+
+def list_proxy_processes() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-lf", "clash|verge|mihomo|surge|v2ray|xray|sing-box|tailscale|warp"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return lines[:6]
+
+
+def classify_diagnostics(steps: list[DiagnosticStep]) -> tuple[str, list[str], int]:
+    flags: list[str] = []
+    failures = [step for step in steps if not step.ok]
+    if not failures:
+        return "healthy", flags, 0
+
+    if any(step.name in {"dns", "tcp", "tls"} for step in failures):
+        flags.append("transport_failures")
+    if any(step.name.startswith("ws ") for step in failures):
+        flags.append("responses_ws_failed")
+    if any(step.name.endswith("/compact") for step in failures):
+        flags.append("compact_endpoint_failed")
+    if any(step.reason == "cloudflare_challenge" for step in steps):
+        flags.append("cloudflare_challenge")
+    if any(
+        (step.reason and ("SSL" in step.reason or "Timeout" in step.reason))
+        or (step.detail and ("EOF occurred in violation of protocol" in step.detail or "timed out" in step.detail))
+        for step in failures
+    ):
+        return "unhealthy", sorted(set(flags)), 2
+
+    if any(step.status in {401, 403} for step in failures):
+        flags.append("auth_or_policy_response")
+    return "warning", sorted(set(flags)), 1
+
+
+def color_for_overall(overall: str) -> str:
+    if overall == "healthy":
+        return GREEN
+    if overall == "warning":
+        return YELLOW
+    return RED
+
+
+def format_step(step: DiagnosticStep) -> str:
+    status = f"status={step.status}" if step.status is not None else ""
+    latency = f"{step.latency_ms}ms" if step.latency_ms is not None else "-"
+    reason = step.reason or ""
+    detail = step.detail or ""
+    pieces = [piece for piece in [status, reason, detail] if piece]
+    suffix = " | ".join(pieces)
+    marker = f"{GREEN}ok{NC}" if step.ok else f"{RED}fail{NC}"
+    if suffix:
+        return f"  {marker:<13} {step.name:<38} {latency:<10} {suffix}"
+    return f"  {marker:<13} {step.name:<38} {latency}"
+
+
+def run_doctor_attempt(token: str | None) -> list[DiagnosticStep]:
+    return [
+        diagnostic_dns(),
+        diagnostic_tcp(),
+        diagnostic_tls(),
+        diagnostic_https(
+            f"https {MODELS_PATH}",
+            MODELS_PATH,
+            token,
+            ok_statuses={200, 401, 403},
+        ),
+        diagnostic_https(
+            f"https {RESPONSES_COMPACT_PATH}",
+            RESPONSES_COMPACT_PATH,
+            token,
+            method="POST",
+            body=b"{}",
+            ok_statuses={200, 400, 401, 403, 405, 422},
+        ),
+        diagnostic_https(
+            "https /backend-api/wham/usage",
+            "/backend-api/wham/usage",
+            token,
+            ok_statuses={200, 401, 403},
+        ),
+        diagnostic_websocket(token),
+    ]
+
+
+def cmd_doctor() -> int:
+    token = None
+    if AUTH_FILE.exists():
+        try:
+            token = get_access_token(load_auth())
+        except SystemExit:
+            token = None
+
+    attempts: list[list[DiagnosticStep]] = []
+    for attempt_idx in range(2):
+        attempts.append(run_doctor_attempt(token))
+        if attempt_idx == 0:
+            time.sleep(0.4)
+
+    all_steps = [step for attempt in attempts for step in attempt]
+    overall, flags, exit_code = classify_diagnostics(all_steps)
+    route_summary = get_route_summary(next((step.remote_ip for step in all_steps if step.remote_ip), None))
+    proxy_processes = list_proxy_processes()
+    proxy_info = get_proxy_info()
+    codex_path = shutil.which("codex")
+
+    print(f"{BLUE}Codex 网络检测{NC}")
+    print(f"status:      {color_for_overall(overall)}{overall}{NC}")
+    print(f"attempts:    {len(attempts)}")
+    print(f"auth_token:  {'yes' if token else 'no'}")
+    if codex_path:
+        print(f"codex:       {codex_path}")
+    if proxy_info:
+        print(f"doctor_proxy:{proxy_info.display()}")
+    if route_summary:
+        print(f"route:       {route_summary}")
+    if proxy_processes:
+        print(f"proxy:       {proxy_processes[0]}")
+        for line in proxy_processes[1:]:
+            print(f"             {line}")
+    if flags:
+        print(f"flags:       {', '.join(flags)}")
+    print("")
+    for index, attempt in enumerate(attempts, start=1):
+        print(f"[attempt {index}]")
+        for step in attempt:
+            print(format_step(step))
+        if index != len(attempts):
+            print("")
+
+    return exit_code
+
+
+def print_usage_for_auth(name: str, auth: dict[str, Any], *, is_current: bool = False) -> None:
     token = get_access_token(auth)
-    print(f"\n{CYAN}▸ {name}{NC}")
+    plan = get_plan_type(auth)
+    marker = f"{GREEN}*{NC}" if is_current else " "
+    label = f"{name} ({plan})" if plan else name
+    print(f"\n{marker} {CYAN}▸ {label}{NC}")
     if not token:
         print(f"  {RED}无有效 access_token，可能需要重新登录。{NC}")
         return
@@ -665,13 +1296,19 @@ def print_usage_for_auth(name: str, auth: dict[str, Any]) -> None:
     )
 
 
-def cmd_balance(name: str | None) -> None:
+def cmd_balance(names: list[str] | None) -> None:
     index = read_index()
-    if name:
-        account = find_account(index, name)
-        if not account:
-            fail(f"账号 `{name}` 不存在。")
-        print_usage_for_auth(name, load_snapshot(name))
+    current_id = get_current_account_id()
+    if names:
+        for name in names:
+            account = find_account(index, name)
+            if not account:
+                fail(f"账号 `{name}` 不存在。")
+            print_usage_for_auth(
+                name,
+                load_snapshot(name),
+                is_current=account.get("account_id") == current_id,
+            )
         return
 
     accounts = index.get("accounts", [])
@@ -679,7 +1316,11 @@ def cmd_balance(name: str | None) -> None:
         print(f"{YELLOW}还没有保存任何账号。{NC}")
         return
     for account in accounts:
-        print_usage_for_auth(str(account["name"]), load_snapshot(str(account["name"])))
+        print_usage_for_auth(
+            str(account["name"]),
+            load_snapshot(str(account["name"])),
+            is_current=account.get("account_id") == current_id,
+        )
 
 
 def main(argv: list[str]) -> int:
@@ -704,11 +1345,13 @@ def main(argv: list[str]) -> int:
         elif command == "update":
             cmd_update(arg1 or None)
         elif command in {"remove", "rm"}:
-            cmd_remove(arg1)
+            cmd_remove(argv[2:])
         elif command == "rename":
             cmd_rename(arg1, arg2)
         elif command in {"balance", "bal"}:
-            cmd_balance(arg1 or None)
+            cmd_balance(argv[2:] or None)
+        elif command in {"doctor", "diag"}:
+            return cmd_doctor()
         else:
             fail(f"未知命令: {command}")
     except subprocess.CalledProcessError as exc:
