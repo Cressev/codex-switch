@@ -223,6 +223,17 @@ def get_plan_type(auth: dict[str, Any]) -> str:
     return ""
 
 
+def get_plan_expiry(auth: dict[str, Any]) -> str:
+    id_token = auth.get("tokens", {}).get("id_token")
+    if isinstance(id_token, str) and id_token:
+        openai_auth = decode_jwt_payload(id_token).get("https://api.openai.com/auth", {})
+        if isinstance(openai_auth, dict):
+            until = openai_auth.get("chatgpt_subscription_active_until")
+            if isinstance(until, str) and until:
+                return until[:10]
+    return ""
+
+
 def find_account(index: dict[str, Any], name: str) -> dict[str, Any] | None:
     for account in index.get("accounts", []):
         if account.get("name") == name:
@@ -450,15 +461,18 @@ def cmd_list() -> None:
         marker = f"{GREEN}*{NC}" if account.get("account_id") == current_id else " "
         email = ""
         plan = ""
+        expiry = ""
         try:
             snap = load_snapshot(str(account.get("name")))
             email = get_email(snap)
             plan = get_plan_type(snap)
+            expiry = get_plan_expiry(snap)
         except SystemExit:
             pass
         print(f"{marker} {YELLOW}{account.get('name')}{NC}")
         if plan:
-            print(f"    plan:       {plan}")
+            label = f"{plan}" + (f"  至 {expiry}" if expiry else "")
+            print(f"    plan:       {label}")
         if email:
             print(f"    email:      {email}")
         print(f"    account_id: {account.get('account_id')}")
@@ -1243,8 +1257,9 @@ def cmd_doctor() -> int:
 def print_usage_for_auth(name: str, auth: dict[str, Any], *, is_current: bool = False) -> None:
     token = get_access_token(auth)
     plan = get_plan_type(auth)
+    expiry = get_plan_expiry(auth)
     marker = f"{GREEN}*{NC}" if is_current else " "
-    label = f"{name} ({plan})" if plan else name
+    label = f"{name} ({plan}" + (f"  至 {expiry}" if expiry else "") + ")" if plan else name
     print(f"\n{marker} {CYAN}▸ {label}{NC}")
     if not token:
         print(f"  {RED}无有效 access_token，可能需要重新登录。{NC}")
