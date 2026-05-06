@@ -13,6 +13,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -449,6 +450,7 @@ def cmd_help() -> None:
     print("  remove, rm <name|#n>  删除账号")
     print("  rename <old|#n> <new> 重命名账号")
     print("  balance, bal [name|#n] 查询额度")
+    print("  tui                   交互式 TUI 界面（动态额度、切换、刷新）")
     print("  doctor, diag          检测 Codex / compact / usage 网络链路")
     print("  help                  显示帮助")
     print("")
@@ -1227,6 +1229,306 @@ def run_doctor_attempt(token: str | None) -> list[DiagnosticStep]:
     ]
 
 
+REFRESH_OPTIONS = [60, 120, 300, 600, 1800]
+REFRESH_LABELS = ["1min", "2min", "5min", "10min", "30min"]
+
+TL = "┌"
+TR = "┐"
+BL = "└"
+BR = "┘"
+HZ = "─"
+VT = "│"
+LJ = "├"
+RJ = "┤"
+SP = "·"
+
+
+def _tui_fetch_one(name: str, state: dict, lock: threading.Lock) -> None:
+    token = None
+    plan = ""
+    expiry = ""
+    try:
+        snap = load_snapshot(name)
+        token = get_access_token(snap)
+        plan = get_plan_type(snap)
+        expiry = get_plan_expiry(snap)
+    except SystemExit:
+        pass
+    result: dict[str, Any] = {"plan": plan, "expiry": expiry, "primary": None, "secondary": None, "error": None}
+    if token:
+        usage = fetch_usage(token)
+        if usage.payload is not None:
+            rl = usage.payload.get("rate_limit", {})
+            if isinstance(rl, dict):
+                result["primary"] = parse_window(rl.get("primary_window"))
+                result["secondary"] = parse_window(rl.get("secondary_window"))
+        else:
+            result["error"] = usage.error_message or "未知错误"
+    else:
+        result["error"] = "无有效 token"
+    with lock:
+        state["balances"][name] = result
+        state["loading"].discard(name)
+        state["dirty"] = True
+
+
+def _tui_fetch_all(accounts: list[dict[str, Any]], state: dict, lock: threading.Lock) -> None:
+    for account in accounts:
+        name = str(account["name"])
+        with lock:
+            state["loading"].add(name)
+            state["dirty"] = True
+        threading.Thread(target=_tui_fetch_one, args=(name, state, lock), daemon=True).start()
+
+
+def _tui_bar(remaining_pct: int | None, width: int = 20) -> str:
+    if remaining_pct is None:
+        return SP * width
+    filled = min(max(round(remaining_pct / 100 * width), 0), width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _tui_color_pct(pct: int | None) -> int:
+    if pct is None:
+        return 0
+    if pct <= 20:
+        return 1
+    if pct <= 50:
+        return 2
+    return 3
+
+
+def cmd_tui() -> None:
+    import curses as _curses
+    import time as _time
+
+    index = read_index()
+    accounts = sorted_accounts(index)
+    if not accounts:
+        print(f"{YELLOW}还没有保存任何账号。{NC}")
+        return
+
+    current_id = get_current_account_id()
+    lock = threading.Lock()
+    state: dict[str, Any] = {
+        "selected": 0,
+        "ri": 2,
+        "countdown": REFRESH_OPTIONS[2],
+        "balances": {},
+        "loading": set(),
+        "dirty": True,
+        "running": True,
+        "current_id": current_id,
+        "msg": "",
+        "msg_t": 0.0,
+    }
+
+    _tui_fetch_all(accounts, state, lock)
+
+    def _safe_add(stdscr: Any, row: int, col: int, text: str, attr: int = 0) -> None:
+        h, w = stdscr.getmaxyx()
+        if row < 0 or row >= h or col >= w:
+            return
+        max_len = w - col
+        if max_len <= 0:
+            return
+        try:
+            stdscr.addstr(row, col, text[:max_len], attr)
+        except _curses.error:
+            pass
+
+    def _draw(stdscr: Any) -> None:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        with lock:
+            sel = state["selected"]
+            ri = state["ri"]
+            cd = state["countdown"]
+            bals = dict(state["balances"])
+            loading = set(state["loading"])
+            cid = state["current_id"]
+            msg = state["msg"]
+            mt = state["msg_t"]
+            state["dirty"] = False
+
+        il = REFRESH_LABELS[ri]
+        cm, cs = divmod(cd, 60)
+        inner = w - 2
+
+        header = f" codex-switch  {HZ}  {il}  {HZ}  {cm}:{cs:02d} "
+        _safe_add(stdscr, 0, 0, TL + header.center(inner, HZ) + TR, _curses.A_BOLD)
+
+        row = 1
+        for i, account in enumerate(accounts):
+            if row + 4 >= h - 1:
+                break
+            name = str(account["name"])
+            is_cur = account.get("account_id") == cid
+            is_sel = i == sel
+            is_load = name in loading
+            bal = bals.get(name, {})
+            plan = bal.get("plan", "")
+            expiry = bal.get("expiry", "")
+
+            tag = " ●" if is_cur else "  "
+            num = f"{i+1}."
+            plan_s = f"  {plan}" + (f"  至 {expiry}" if expiry else "") if plan else ""
+            name_part = f"{num} {name}{plan_s}"
+            is_first = i == 0
+            is_last = i == len(accounts) - 1
+            lc = LJ if not is_first else VT
+            rc = RJ if not is_first else VT
+
+            if is_sel:
+                line = f"{tag} {name_part}"
+                line = line[:inner]
+                _safe_add(stdscr, row, 0, lc, _curses.A_BOLD)
+                _safe_add(stdscr, row, 1, f" {line} ", _curses.A_REVERSE)
+                col_end = 1 + 1 + len(line) + 1
+                if col_end < w - 1:
+                    _safe_add(stdscr, row, col_end, " " * (w - 1 - col_end), _curses.A_REVERSE)
+                _safe_add(stdscr, row, w - 1, rc, _curses.A_BOLD)
+            else:
+                attr_name = _curses.A_BOLD if is_cur else 0
+                line = f"{tag} {name_part}"
+                _safe_add(stdscr, row, 0, VT)
+                _safe_add(stdscr, row, 2, line, attr_name)
+                _safe_add(stdscr, row, w - 1, VT)
+            row += 1
+
+            if is_load:
+                loading_text = f"  {SP * 3} loading"
+                _safe_add(stdscr, row, 0, VT)
+                _safe_add(stdscr, row, 2, loading_text)
+                _safe_add(stdscr, row, w - 1, VT)
+            elif bal.get("error"):
+                err_text = f"  ✗ {bal['error']}"
+                _safe_add(stdscr, row, 0, VT)
+                _safe_add(stdscr, row, 2, err_text, _curses.color_pair(1))
+                _safe_add(stdscr, row, w - 1, VT)
+            elif bal.get("primary"):
+                pri = bal["primary"]
+                sec = bal.get("secondary")
+                rp = pri.remaining_percent
+                bw = min(20, max(5, inner - 36))
+                bar = _tui_bar(rp, bw)
+                pct_s = f"{rp:>3}%" if rp is not None else " ??%"
+                reset_s = format_duration(pri.reset_after_seconds)
+                line_pri = f"  day {pct_s} {bar}  ↻ {reset_s}"
+                cp = _tui_color_pct(rp)
+                attr = _curses.color_pair(cp) if cp else 0
+                _safe_add(stdscr, row, 0, VT)
+                _safe_add(stdscr, row, 2, line_pri, attr)
+                _safe_add(stdscr, row, w - 1, VT)
+                row += 1
+                if sec and sec.used_percent is not None and row + 1 < h - 1:
+                    rp2 = sec.remaining_percent
+                    bar2 = _tui_bar(rp2, bw)
+                    pct_s2 = f"{rp2:>3}%" if rp2 is not None else " ??%"
+                    reset_s2 = format_duration(sec.reset_after_seconds)
+                    line_sec = f"  wk  {pct_s2} {bar2}  ↻ {reset_s2}"
+                    cp2 = _tui_color_pct(rp2)
+                    attr2 = _curses.color_pair(cp2) if cp2 else 0
+                    _safe_add(stdscr, row, 0, VT)
+                    _safe_add(stdscr, row, 2, line_sec, attr2)
+                    _safe_add(stdscr, row, w - 1, VT)
+                else:
+                    row -= 1
+            else:
+                _safe_add(stdscr, row, 0, VT)
+                _safe_add(stdscr, row, 2, "  ─")
+                _safe_add(stdscr, row, w - 1, VT)
+
+            row += 1
+
+            lc2 = LJ if not is_last else BL
+            rc2 = RJ if not is_last else BR
+            _safe_add(stdscr, row, 0, lc2 + HZ * inner + rc2)
+            row += 1
+
+        now = _time.time()
+        if msg and now - mt < 3:
+            bot = f" {msg}"
+        else:
+            bot = " ↑↓ jk │ Enter 切换 │ r 刷新 │ +/- 间隔 │ q 退出 "
+        _safe_add(stdscr, h - 1, 0, " " + bot[:inner].center(inner), _curses.A_DIM)
+        stdscr.refresh()
+
+    def _main(stdscr: Any) -> None:
+        _curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(1000)
+        try:
+            _curses.init_pair(1, _curses.COLOR_RED, 0)
+            _curses.init_pair(2, _curses.COLOR_YELLOW, 0)
+            _curses.init_pair(3, _curses.COLOR_GREEN, 0)
+        except Exception:
+            pass
+        last = _time.time()
+        while state["running"]:
+            _draw(stdscr)
+            try:
+                ch = stdscr.getch()
+            except Exception:
+                ch = -1
+            if ch in (ord("q"), ord("Q")):
+                state["running"] = False
+                break
+            elif ch in (_curses.KEY_UP, ord("k"), ord("K")):
+                with lock:
+                    state["selected"] = max(0, state["selected"] - 1)
+                    state["dirty"] = True
+            elif ch in (_curses.KEY_DOWN, ord("j"), ord("J")):
+                with lock:
+                    state["selected"] = min(len(accounts) - 1, state["selected"] + 1)
+                    state["dirty"] = True
+            elif ch in (ord("\n"), ord("\r")):
+                name = str(accounts[state["selected"]]["name"])
+                try:
+                    snap = load_snapshot(name)
+                    write_auth(snap)
+                    state["current_id"] = get_account_id(snap)
+                    state["msg"] = f"✓ 已切换到 {name}"
+                    state["msg_t"] = _time.time()
+                except SystemExit:
+                    state["msg"] = "✗ 切换失败"
+                    state["msg_t"] = _time.time()
+                with lock:
+                    state["dirty"] = True
+            elif ch in (ord("r"), ord("R")):
+                with lock:
+                    state["countdown"] = REFRESH_OPTIONS[state["ri"]]
+                    state["dirty"] = True
+                _tui_fetch_all(accounts, state, lock)
+                state["msg"] = "⟳ 刷新中..."
+                state["msg_t"] = _time.time()
+            elif ch in (ord("+"), ord("=")):
+                with lock:
+                    state["ri"] = min(len(REFRESH_OPTIONS) - 1, state["ri"] + 1)
+                    state["countdown"] = REFRESH_OPTIONS[state["ri"]]
+                    state["dirty"] = True
+            elif ch in (ord("-"), ord("_")):
+                with lock:
+                    state["ri"] = max(0, state["ri"] - 1)
+                    state["countdown"] = REFRESH_OPTIONS[state["ri"]]
+                    state["dirty"] = True
+            now = _time.time()
+            elapsed = now - last
+            last = now
+            with lock:
+                state["countdown"] = max(0, state["countdown"] - int(elapsed))
+                if state["countdown"] <= 0:
+                    state["countdown"] = REFRESH_OPTIONS[state["ri"]]
+                    state["dirty"] = True
+            if state["dirty"]:
+                _draw(stdscr)
+
+    try:
+        _curses.wrapper(_main)
+    except KeyboardInterrupt:
+        pass
+
+
 def cmd_doctor() -> int:
     token = None
     if AUTH_FILE.exists():
@@ -1392,6 +1694,8 @@ def main(argv: list[str]) -> int:
             cmd_balance(argv[2:] or None)
         elif command in {"doctor", "diag"}:
             return cmd_doctor()
+        elif command == "tui":
+            cmd_tui()
         else:
             fail(f"未知命令: {command}")
     except subprocess.CalledProcessError as exc:
