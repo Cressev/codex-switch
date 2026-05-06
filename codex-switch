@@ -1414,7 +1414,8 @@ def cmd_tui() -> None:
                 bar = _tui_bar(rp, bw)
                 pct_s = f"{rp:>3}%" if rp is not None else " ??%"
                 reset_s = format_duration(pri.reset_after_seconds)
-                line_pri = f"  day {pct_s} {bar}  ↻ {reset_s}"
+                reset_at_s = format_timestamp(pri.reset_at)
+                line_pri = f"  5h  {pct_s} {bar}  ↻ {reset_s} ({reset_at_s})"
                 cp = _tui_color_pct(rp)
                 attr = _curses.color_pair(cp) if cp else 0
                 _safe_add(stdscr, row, 0, VT)
@@ -1426,7 +1427,8 @@ def cmd_tui() -> None:
                     bar2 = _tui_bar(rp2, bw)
                     pct_s2 = f"{rp2:>3}%" if rp2 is not None else " ??%"
                     reset_s2 = format_duration(sec.reset_after_seconds)
-                    line_sec = f"  wk  {pct_s2} {bar2}  ↻ {reset_s2}"
+                    reset_at_s2 = format_timestamp(sec.reset_at)
+                    line_sec = f"  wk  {pct_s2} {bar2}  ↻ {reset_s2} ({reset_at_s2})"
                     cp2 = _tui_color_pct(rp2)
                     attr2 = _curses.color_pair(cp2) if cp2 else 0
                     _safe_add(stdscr, row, 0, VT)
@@ -1450,9 +1452,107 @@ def cmd_tui() -> None:
         if msg and now - mt < 3:
             bot = f" {msg}"
         else:
-            bot = " ↑↓ jk │ Enter 切换 │ r 刷新 │ +/- 间隔 │ q 退出 "
+            bot = " ↑↓ jk │ Enter 切换 │ r 刷新 │ d 检测 │ +/- 间隔 │ q 退出 "
         _safe_add(stdscr, h - 1, 0, " " + bot[:inner].center(inner), _curses.A_DIM)
         stdscr.refresh()
+
+    def _run_doctor_panel(stdscr: Any) -> None:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        inner = w - 2
+
+        token = None
+        try:
+            token = get_access_token(load_auth())
+        except SystemExit:
+            pass
+
+        _safe_add(stdscr, 0, 0, TL + " Codex 网络检测中... ".center(inner, HZ) + TR, _curses.A_BOLD)
+        _safe_add(stdscr, 1, 0, VT + " " * inner + VT)
+        _safe_add(stdscr, 2, 0, BL + HZ * inner + BR)
+        stdscr.refresh()
+
+        attempts: list[list[DiagnosticStep]] = []
+        for attempt_idx in range(2):
+            attempts.append(run_doctor_attempt(token))
+            if attempt_idx == 0:
+                time.sleep(0.4)
+
+        all_steps = [step for attempt in attempts for step in attempt]
+        overall, flags, exit_code = classify_diagnostics(all_steps)
+        route_summary = get_route_summary(next((step.remote_ip for step in all_steps if step.remote_ip), None))
+        proxy_processes = list_proxy_processes()
+        proxy_info = get_proxy_info()
+        codex_path = shutil.which("codex")
+
+        lines: list[tuple[str, int]] = []
+
+        ov_color = {1: _curses.A_BOLD | _curses.color_pair(3), 2: _curses.A_BOLD | _curses.color_pair(2), 3: _curses.A_BOLD | _curses.color_pair(1)}
+        ov_cp = {1: 3, 2: 2, 3: 1}
+        ov_idx = 1 if overall == "healthy" else (2 if overall == "degraded" else 3)
+        lines.append((f"  status: {overall}", _curses.color_pair(ov_cp[ov_idx]) | _curses.A_BOLD))
+        lines.append((f"  auth_token: {'yes' if token else 'no'}", 0))
+        if codex_path:
+            lines.append((f"  codex: {codex_path}", 0))
+        if proxy_info:
+            lines.append((f"  proxy: {proxy_info.display()}", 0))
+        if route_summary:
+            lines.append((f"  route: {route_summary}", 0))
+        if proxy_processes:
+            lines.append((f"  proxy_proc: {proxy_processes[0]}", 0))
+            for pp in proxy_processes[1:]:
+                lines.append((f"              {pp}", 0))
+        if flags:
+            lines.append((f"  flags: {', '.join(flags)}", 0))
+        lines.append(("", 0))
+
+        for ai, attempt in enumerate(attempts, start=1):
+            lines.append((f"  [attempt {ai}]", _curses.A_BOLD))
+            for step in attempt:
+                marker = "ok" if step.ok else "fail"
+                m_attr = _curses.color_pair(3) if step.ok else _curses.color_pair(1)
+                lat = f"{step.latency_ms:.0f}ms" if step.latency_ms is not None else "-"
+                suffix_parts = []
+                if step.status is not None:
+                    suffix_parts.append(f"status={step.status}")
+                if step.reason:
+                    suffix_parts.append(step.reason)
+                if step.detail:
+                    suffix_parts.append(step.detail)
+                suffix = " | ".join(suffix_parts)
+                if suffix:
+                    line = f"    {marker:<5} {step.name:<36} {lat:<8} {suffix}"
+                else:
+                    line = f"    {marker:<5} {step.name:<36} {lat}"
+                lines.append((line, m_attr))
+            if ai != len(attempts):
+                lines.append(("", 0))
+
+        box_h = min(len(lines) + 2, h - 2)
+        stdscr.erase()
+        _safe_add(stdscr, 0, 0, TL + f" Codex 网络检测 ({overall}) ".center(inner, HZ) + TR, _curses.A_BOLD)
+
+        for idx in range(box_h - 2):
+            r = idx + 1
+            _safe_add(stdscr, r, 0, VT)
+            if idx < len(lines):
+                text, attr = lines[idx]
+                _safe_add(stdscr, r, 1, f" {text}", attr)
+            _safe_add(stdscr, r, w - 1, VT)
+
+        _safe_add(stdscr, box_h - 1, 0, BL + HZ * inner + BR)
+        _safe_add(stdscr, h - 1, 0, " 按任意键返回 ".center(w), _curses.A_DIM)
+        stdscr.refresh()
+
+        stdscr.nodelay(False)
+        try:
+            stdscr.getch()
+        except Exception:
+            pass
+        stdscr.nodelay(True)
+        stdscr.timeout(1000)
+        with lock:
+            state["dirty"] = True
 
     def _main(stdscr: Any) -> None:
         _curses.curs_set(0)
@@ -1502,6 +1602,8 @@ def cmd_tui() -> None:
                 _tui_fetch_all(accounts, state, lock)
                 state["msg"] = "⟳ 刷新中..."
                 state["msg_t"] = _time.time()
+            elif ch in (ord("d"), ord("D")):
+                _run_doctor_panel(stdscr)
             elif ch in (ord("+"), ord("=")):
                 with lock:
                     state["ri"] = min(len(REFRESH_OPTIONS) - 1, state["ri"] + 1)
@@ -1520,6 +1622,11 @@ def cmd_tui() -> None:
                 if state["countdown"] <= 0:
                     state["countdown"] = REFRESH_OPTIONS[state["ri"]]
                     state["dirty"] = True
+                    need_fetch = True
+                else:
+                    need_fetch = False
+            if need_fetch:
+                _tui_fetch_all(accounts, state, lock)
             if state["dirty"]:
                 _draw(stdscr)
 
