@@ -29,6 +29,7 @@ CONFIG_FILE = CODEX_DIR / "config.toml"
 STATE_DIR = Path.home() / "Library" / "Application Support" / "codex-switch-mac"
 INDEX_FILE = STATE_DIR / "index.json"
 OFFICIAL_CONFIG_BACKUP = STATE_DIR / "config-official.toml"
+CURRENT_FILE = STATE_DIR / "current"
 KEYCHAIN_SERVICE = "codex-switch-mac"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_HOST = "chatgpt.com"
@@ -184,9 +185,30 @@ def get_current_account_id() -> str:
     if not AUTH_FILE.exists():
         return ""
     try:
-        return get_account_id(load_auth())
+        aid = get_account_id(load_auth())
+        if aid:
+            return aid
     except SystemExit:
-        return ""
+        pass
+    name = get_current_name()
+    if name:
+        acct = find_account(read_index(), name)
+        if acct:
+            return str(acct.get("account_id", ""))
+    return ""
+
+
+def get_current_name() -> str:
+    if CURRENT_FILE.exists():
+        name = CURRENT_FILE.read_text().strip()
+        if name:
+            return name
+    return ""
+
+
+def set_current_name(name: str) -> None:
+    ensure_state_dir()
+    CURRENT_FILE.write_text(name + "\n")
 
 
 def get_last_refresh(auth: dict[str, Any]) -> str:
@@ -494,10 +516,11 @@ def cmd_list() -> None:
         return
 
     current_id = get_current_account_id()
+    current_name = get_current_name()
     print(f"{BLUE}已保存账号{NC}")
     print("")
     for i, account in enumerate(accounts, start=1):
-        marker = f"{GREEN}*{NC}" if account.get("account_id") == current_id else " "
+        marker = f"{GREEN}*{NC}" if (account.get("account_id") == current_id) or (not current_id and account.get("name") == current_name) else " "
         email = ""
         plan = ""
         expiry = ""
@@ -611,6 +634,7 @@ def cmd_switch(name: str) -> None:
         write_auth(auth)
         restore_official_config()
 
+    set_current_name(name)
     print(f"{GREEN}已切换到 `{name}`。{NC}")
     print(f"account_id: {get_account_id(auth)}")
 
@@ -1379,6 +1403,7 @@ def cmd_tui() -> None:
         return
 
     current_id = get_current_account_id()
+    current_name = get_current_name()
     lock = threading.Lock()
     state: dict[str, Any] = {
         "selected": 0,
@@ -1389,6 +1414,7 @@ def cmd_tui() -> None:
         "dirty": True,
         "running": True,
         "current_id": current_id,
+        "current_name": current_name,
         "msg": "",
         "msg_t": 0.0,
     }
@@ -1450,6 +1476,7 @@ def cmd_tui() -> None:
             bals = dict(state["balances"])
             loading = set(state["loading"])
             cid = state["current_id"]
+            current_name = state.get("current_name", "")
             msg = state["msg"]
             mt = state["msg_t"]
             state["dirty"] = False
@@ -1469,7 +1496,7 @@ def cmd_tui() -> None:
             if row + 4 >= h - 1:
                 break
             name = str(account["name"])
-            is_cur = account.get("account_id") == cid
+            is_cur = account.get("account_id") == cid or (not cid and account.get("name") == current_name)
             is_sel = i == sel
             is_load = name in loading
             is_relay = account.get("type") == "relay"
@@ -1710,7 +1737,9 @@ def cmd_tui() -> None:
                     else:
                         write_auth(auth_data)
                         restore_official_config()
-                    state["current_id"] = get_account_id(auth_data)
+                    state["current_id"] = get_account_id(auth_data) or (acct.get("account_id", "") if acct else "")
+                    state["current_name"] = name
+                    set_current_name(name)
                     state["msg"] = f"✓ 已切换到 {name}"
                     state["msg_t"] = _time.time()
                 except SystemExit:
