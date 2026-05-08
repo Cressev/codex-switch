@@ -1325,15 +1325,48 @@ def cmd_tui() -> None:
 
     _tui_fetch_all(accounts, state, lock)
 
+    def _dw(s: str) -> int:
+        import unicodedata as _ud
+        w = 0
+        for ch in s:
+            eaw = _ud.east_asian_width(ch)
+            w += 2 if eaw in ("W", "F") else 1
+        return w
+
+    def _pad_left(text: str, width: int, fill: str = " ") -> str:
+        d = _dw(text)
+        return text + fill * max(0, width - d)
+
+    def _pad_right(text: str, width: int, fill: str = " ") -> str:
+        d = _dw(text)
+        return fill * max(0, width - d) + text
+
+    def _pad_center(text: str, width: int, fill: str = " ") -> str:
+        d = _dw(text)
+        gap = max(0, width - d)
+        left = gap // 2
+        return fill * left + text + fill * (gap - left)
+
     def _safe_add(stdscr: Any, row: int, col: int, text: str, attr: int = 0) -> None:
         h, w = stdscr.getmaxyx()
         if row < 0 or row >= h or col >= w:
             return
-        max_len = w - col
-        if max_len <= 0:
+        max_cols = w - col
+        if max_cols <= 0:
             return
+        if _dw(text) <= max_cols:
+            truncated = text
+        else:
+            truncated = ""
+            tw = 0
+            for ch in text:
+                cw = 2 if ch in ("█", "░", "●") or _dw(ch) > 1 else 1
+                if tw + cw > max_cols:
+                    break
+                truncated += ch
+                tw += cw
         try:
-            stdscr.addstr(row, col, text[:max_len], attr)
+            stdscr.addstr(row, col, truncated, attr)
         except _curses.error:
             pass
 
@@ -1355,8 +1388,11 @@ def cmd_tui() -> None:
         cm, cs = divmod(cd, 60)
         inner = w - 2
 
-        header = f" codex-switch  {HZ}  {il}  {HZ}  {cm}:{cs:02d} "
-        _safe_add(stdscr, 0, 0, TL + header.center(inner, HZ) + TR, _curses.A_BOLD)
+        left = " codex-switch "
+        right = f" 刷新间隔 {il} │ 下次刷新 {cm}:{cs:02d} "
+        fill_n = max(0, inner - _dw(left) - _dw(right))
+        header = left + HZ * fill_n + right
+        _safe_add(stdscr, 0, 0, TL + _pad_center(header, inner, HZ) + TR, _curses.A_BOLD)
 
         row = 1
         for i, account in enumerate(accounts):
@@ -1381,10 +1417,10 @@ def cmd_tui() -> None:
 
             if is_sel:
                 line = f"{tag} {name_part}"
-                line = line[:inner]
                 _safe_add(stdscr, row, 0, lc, _curses.A_BOLD)
+                line_w = _dw(line)
+                col_end = 2 + line_w + 1
                 _safe_add(stdscr, row, 1, f" {line} ", _curses.A_REVERSE)
-                col_end = 1 + 1 + len(line) + 1
                 if col_end < w - 1:
                     _safe_add(stdscr, row, col_end, " " * (w - 1 - col_end), _curses.A_REVERSE)
                 _safe_add(stdscr, row, w - 1, rc, _curses.A_BOLD)
@@ -1410,7 +1446,7 @@ def cmd_tui() -> None:
                 pri = bal["primary"]
                 sec = bal.get("secondary")
                 rp = pri.remaining_percent
-                bw = min(20, max(5, inner - 36))
+                bw = min(20, max(5, inner - 52))
                 bar = _tui_bar(rp, bw)
                 pct_s = f"{rp:>3}%" if rp is not None else " ??%"
                 reset_s = format_duration(pri.reset_after_seconds)
@@ -1452,7 +1488,7 @@ def cmd_tui() -> None:
         if msg and now - mt < 3:
             bot = f" {msg}"
         else:
-            bot = " ↑↓ jk │ Enter 切换 │ r 刷新 │ d 检测 │ +/- 间隔 │ q 退出 "
+            bot = " ↑↓ 选择 │ Enter 切换账号 │ r 刷新额度 │ d 网络检测 │ +/- 调整刷新间隔 │ q 退出 "
         _safe_add(stdscr, h - 1, 0, " " + bot[:inner].center(inner), _curses.A_DIM)
         stdscr.refresh()
 
@@ -1467,7 +1503,7 @@ def cmd_tui() -> None:
         except SystemExit:
             pass
 
-        _safe_add(stdscr, 0, 0, TL + " Codex 网络检测中... ".center(inner, HZ) + TR, _curses.A_BOLD)
+        _safe_add(stdscr, 0, 0, TL + _pad_center(" Codex 网络检测中... ", inner, HZ) + TR, _curses.A_BOLD)
         _safe_add(stdscr, 1, 0, VT + " " * inner + VT)
         _safe_add(stdscr, 2, 0, BL + HZ * inner + BR)
         stdscr.refresh()
@@ -1530,7 +1566,7 @@ def cmd_tui() -> None:
 
         box_h = min(len(lines) + 2, h - 2)
         stdscr.erase()
-        _safe_add(stdscr, 0, 0, TL + f" Codex 网络检测 ({overall}) ".center(inner, HZ) + TR, _curses.A_BOLD)
+        _safe_add(stdscr, 0, 0, TL + _pad_center(f" Codex 网络检测 ({overall}) ", inner, HZ) + TR, _curses.A_BOLD)
 
         for idx in range(box_h - 2):
             r = idx + 1
