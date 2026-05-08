@@ -25,8 +25,10 @@ from typing import Any
 
 CODEX_DIR = Path.home() / ".codex"
 AUTH_FILE = CODEX_DIR / "auth.json"
+CONFIG_FILE = CODEX_DIR / "config.toml"
 STATE_DIR = Path.home() / "Library" / "Application Support" / "codex-switch-mac"
 INDEX_FILE = STATE_DIR / "index.json"
+OFFICIAL_CONFIG_BACKUP = STATE_DIR / "config-official.toml"
 KEYCHAIN_SERVICE = "codex-switch-mac"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_HOST = "chatgpt.com"
@@ -140,6 +142,17 @@ def load_auth(path: Path = AUTH_FILE) -> dict[str, Any]:
 def write_auth(auth: dict[str, Any], path: Path = AUTH_FILE) -> None:
     CODEX_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(auth, ensure_ascii=False, indent=2) + "\n")
+
+
+def backup_official_config() -> None:
+    if CONFIG_FILE.exists() and not OFFICIAL_CONFIG_BACKUP.exists():
+        ensure_state_dir()
+        OFFICIAL_CONFIG_BACKUP.write_text(CONFIG_FILE.read_text())
+
+
+def restore_official_config() -> None:
+    if OFFICIAL_CONFIG_BACKUP.exists():
+        CONFIG_FILE.write_text(OFFICIAL_CONFIG_BACKUP.read_text())
 
 
 def get_account_id(auth: dict[str, Any]) -> str:
@@ -263,13 +276,15 @@ def find_account_by_id(index: dict[str, Any], account_id: str) -> dict[str, Any]
     return None
 
 
-def save_snapshot(name: str, auth: dict[str, Any]) -> str:
-    account_id = get_account_id(auth)
-    if not account_id:
-        fail("当前认证文件里没有有效的 account_id。")
+def save_snapshot(name: str, auth: dict[str, Any], config_toml: str | None = None) -> str:
+    account_id = get_account_id(auth) or "relay-" + name
+
+    payload: dict[str, Any] = {"auth": auth}
+    if config_toml is not None:
+        payload["config_toml"] = config_toml
 
     encoded = base64.b64encode(
-        json.dumps(auth, ensure_ascii=False).encode("utf-8")
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
 
     subprocess.run(
@@ -294,10 +309,11 @@ def save_snapshot(name: str, auth: dict[str, Any]) -> str:
     index = read_index()
     existing = find_account(index, name)
     saved_at = now_utc()
-    entry = {
+    entry: dict[str, Any] = {
         "name": name,
         "account_id": account_id,
         "saved_at": saved_at,
+        "type": "relay" if config_toml is not None else "official",
     }
     if existing:
         existing.update(entry)
@@ -368,9 +384,12 @@ def load_snapshot(name: str) -> dict[str, Any]:
         fail(f"Keychain 中没有找到账号 `{name}`。")
     try:
         decoded = base64.b64decode(result.stdout.strip().encode("ascii"))
-        return json.loads(decoded.decode("utf-8"))
+        obj = json.loads(decoded.decode("utf-8"))
     except Exception as exc:
         fail(f"读取 Keychain 快照失败: {exc}")
+    if isinstance(obj, dict) and "auth" in obj:
+        return obj
+    return {"auth": obj, "config_toml": None}
 
 
 def delete_snapshot(name: str) -> None:
@@ -445,6 +464,7 @@ def cmd_help() -> None:
     print("  status                查看当前 auth.json 对应的账号")
     print("  save <name>           保存当前已登录账号到指定名称")
     print("  add <name>            登录一个新账号并保存，然后恢复当前登录")
+    print("  add-relay <name> <auth> <config>  添加中转站账号（提供 auth.json 和 config.toml 路径）")
     print("  switch, sw <name|#n>  切换到指定账号")
     print("  update [name|#n]      重新登录并更新指定账号")
     print("  remove, rm <name|#n>  删除账号")
@@ -459,6 +479,7 @@ def cmd_help() -> None:
     print("示例:")
     print("  codex-switch save work")
     print("  codex-switch add work")
+    print("  codex-switch add-relay my-relay ~/relay-auth.json ~/relay-config.toml")
     print("  codex-switch switch #2")
     print("  codex-switch balance #1 #3")
     print("  codex-switch doctor")
@@ -480,14 +501,17 @@ def cmd_list() -> None:
         email = ""
         plan = ""
         expiry = ""
+        account_type = account.get("type", "official")
         try:
             snap = load_snapshot(str(account.get("name")))
-            email = get_email(snap)
-            plan = get_plan_type(snap)
-            expiry = get_plan_expiry(snap)
+            auth_data = snap["auth"]
+            email = get_email(auth_data)
+            plan = get_plan_type(auth_data)
+            expiry = get_plan_expiry(auth_data)
         except SystemExit:
-            pass
-        print(f"{marker} {DIM}{i}.{NC} {YELLOW}{account.get('name')}{NC}")
+            auth_data = {}
+        type_label = f"{DIM}[中转]{NC} " if account_type == "relay" else ""
+        print(f"{marker} {DIM}{i}.{NC} {type_label}{YELLOW}{account.get('name')}{NC}")
         if plan:
             label = f"{plan}" + (f"  至 {expiry}" if expiry else "")
             print(f"    plan:       {label}")
@@ -546,12 +570,47 @@ def cmd_add(name: str) -> None:
         print("当前登录状态已恢复。")
 
 
+def cmd_add_relay(name: str, auth_path: str, config_path: str) -> None:
+    if not name:
+        fail("用法: codex-switch add-relay <name> <auth.json路径> <config.toml路径>")
+    auth_p = Path(auth_path).expanduser().resolve()
+    config_p = Path(config_path).expanduser().resolve()
+    if not auth_p.exists():
+        fail(f"auth 文件不存在: {auth_p}")
+    if not config_p.exists():
+        fail(f"config 文件不存在: {config_p}")
+    try:
+        auth = json.loads(auth_p.read_text())
+    except Exception as exc:
+        fail(f"读取 auth 文件失败: {exc}")
+    if not isinstance(auth, dict):
+        fail("auth 文件格式错误：顶层应为 JSON 对象。")
+    config_toml = config_p.read_text()
+    index = read_index()
+    name = resolve_target_name(index, name)
+    account_id = save_snapshot(name, auth, config_toml)
+    print(f"{GREEN}已添加中转账号 `{name}`。{NC}")
+    print(f"account_id: {account_id}")
+
+
 def cmd_switch(name: str) -> None:
     if not name:
         fail("用法: codex-switch switch <name|#n>")
     name = resolve_name(read_index(), name)
-    auth = load_snapshot(name)
-    write_auth(auth)
+    snap = load_snapshot(name)
+    auth = snap["auth"]
+    config_toml = snap.get("config_toml")
+    account_type = find_account(read_index(), name).get("type", "official")
+
+    if account_type == "relay":
+        if config_toml:
+            backup_official_config()
+            CONFIG_FILE.write_text(config_toml)
+        write_auth(auth)
+    else:
+        write_auth(auth)
+        restore_official_config()
+
     print(f"{GREEN}已切换到 `{name}`。{NC}")
     print(f"account_id: {get_account_id(auth)}")
 
@@ -581,8 +640,8 @@ def cmd_rename(old_name: str, new_name: str) -> None:
         fail(f"账号 `{old_name}` 不存在。")
     if find_account(index, new_name):
         fail(f"账号 `{new_name}` 已存在。")
-    auth = load_snapshot(old_name)
-    save_snapshot(new_name, auth)
+    snap = load_snapshot(old_name)
+    save_snapshot(new_name, snap["auth"], snap.get("config_toml"))
     delete_snapshot(old_name)
     index = read_index()
     index["accounts"] = [item for item in index.get("accounts", []) if item.get("name") != old_name]
@@ -606,7 +665,7 @@ def cmd_update(name: str | None) -> None:
 
     previous_auth = load_auth() if AUTH_FILE.exists() else None
     try:
-        write_auth(load_snapshot(name))
+        write_auth(load_snapshot(name)["auth"])
         updated_auth = run_codex_login()
         account_id = save_snapshot(name, updated_auth)
     finally:
@@ -1247,14 +1306,25 @@ def _tui_fetch_one(name: str, state: dict, lock: threading.Lock) -> None:
     token = None
     plan = ""
     expiry = ""
+    account_type = "official"
     try:
         snap = load_snapshot(name)
-        token = get_access_token(snap)
-        plan = get_plan_type(snap)
-        expiry = get_plan_expiry(snap)
+        auth_data = snap["auth"]
+        token = get_access_token(auth_data)
+        plan = get_plan_type(auth_data)
+        expiry = get_plan_expiry(auth_data)
+        acct = find_account(read_index(), name)
+        if acct:
+            account_type = acct.get("type", "official")
     except SystemExit:
         pass
-    result: dict[str, Any] = {"plan": plan, "expiry": expiry, "primary": None, "secondary": None, "error": None}
+    if account_type == "relay":
+        with lock:
+            state["balances"][name] = {"plan": plan, "expiry": expiry, "primary": None, "secondary": None, "error": None, "relay": True}
+            state["loading"].discard(name)
+            state["dirty"] = True
+        return
+    result: dict[str, Any] = {"plan": plan, "expiry": expiry, "primary": None, "secondary": None, "error": None, "relay": False}
     if token:
         usage = fetch_usage(token)
         if usage.payload is not None:
@@ -1402,14 +1472,16 @@ def cmd_tui() -> None:
             is_cur = account.get("account_id") == cid
             is_sel = i == sel
             is_load = name in loading
+            is_relay = account.get("type") == "relay"
             bal = bals.get(name, {})
             plan = bal.get("plan", "")
             expiry = bal.get("expiry", "")
 
             tag = " ●" if is_cur else "  "
             num = f"{i+1}."
-            plan_s = f"  {plan}" + (f"  至 {expiry}" if expiry else "") if plan else ""
-            name_part = f"{num} {name}{plan_s}"
+            relay_tag = " [中转]" if is_relay else ""
+            plan_s = f"  {plan}" + (f"  至 {expiry}" if expiry else "") if plan and not is_relay else ""
+            name_part = f"{num} {name}{relay_tag}{plan_s}"
             is_first = i == 0
             is_last = i == len(accounts) - 1
             lc = LJ if not is_first else VT
@@ -1436,6 +1508,11 @@ def cmd_tui() -> None:
                 loading_text = f"  {SP * 3} loading"
                 _safe_add(stdscr, row, 0, VT)
                 _safe_add(stdscr, row, 2, loading_text)
+                _safe_add(stdscr, row, w - 1, VT)
+            elif is_relay:
+                relay_text = "  ◈ 中转站 · 不支持余额查询"
+                _safe_add(stdscr, row, 0, VT)
+                _safe_add(stdscr, row, 2, relay_text, _curses.A_DIM)
                 _safe_add(stdscr, row, w - 1, VT)
             elif bal.get("error"):
                 err_text = f"  ✗ {bal['error']}"
@@ -1620,10 +1697,20 @@ def cmd_tui() -> None:
                     state["dirty"] = True
             elif ch in (ord("\n"), ord("\r")):
                 name = str(accounts[state["selected"]]["name"])
+                acct = find_account(read_index(), name)
                 try:
                     snap = load_snapshot(name)
-                    write_auth(snap)
-                    state["current_id"] = get_account_id(snap)
+                    auth_data = snap["auth"]
+                    config_toml = snap.get("config_toml")
+                    if acct and acct.get("type") == "relay":
+                        if config_toml:
+                            backup_official_config()
+                            CONFIG_FILE.write_text(config_toml)
+                        write_auth(auth_data)
+                    else:
+                        write_auth(auth_data)
+                        restore_official_config()
+                    state["current_id"] = get_account_id(auth_data)
                     state["msg"] = f"✓ 已切换到 {name}"
                     state["msg_t"] = _time.time()
                 except SystemExit:
@@ -1787,9 +1874,14 @@ def cmd_balance(names: list[str] | None) -> None:
             account = find_account(index, name)
             if not account:
                 fail(f"账号 `{name}` 不存在。")
+            if account.get("type") == "relay":
+                marker = f"{GREEN}*{NC}" if account.get("account_id") == current_id else " "
+                print(f"\n{marker} {CYAN}▸ {name} {DIM}[中转]{NC}")
+                print(f"  {DIM}中转站账号，不支持余额查询{NC}")
+                continue
             print_usage_for_auth(
                 name,
-                load_snapshot(name),
+                load_snapshot(name)["auth"],
                 is_current=account.get("account_id") == current_id,
             )
         return
@@ -1800,9 +1892,15 @@ def cmd_balance(names: list[str] | None) -> None:
         return
     for i, account in enumerate(accounts, start=1):
         name = str(account["name"])
+        if account.get("type") == "relay":
+            marker = f"{GREEN}*{NC}" if account.get("account_id") == current_id else " "
+            prefix = f"{DIM}{i}.{NC} "
+            print(f"\n{marker} {prefix}{CYAN}▸ {name} {DIM}[中转]{NC}")
+            print(f"  {DIM}中转站账号，不支持余额查询{NC}")
+            continue
         print_usage_for_auth(
             name,
-            load_snapshot(name),
+            load_snapshot(name)["auth"],
             is_current=account.get("account_id") == current_id,
             seq=i,
         )
@@ -1813,6 +1911,7 @@ def main(argv: list[str]) -> int:
     command = argv[1] if len(argv) > 1 else "help"
     arg1 = argv[2] if len(argv) > 2 else ""
     arg2 = argv[3] if len(argv) > 3 else ""
+    arg3 = argv[4] if len(argv) > 4 else ""
 
     try:
         if command in {"help", "-h", "--help"}:
@@ -1825,6 +1924,8 @@ def main(argv: list[str]) -> int:
             cmd_save(arg1)
         elif command == "add":
             cmd_add(arg1)
+        elif command == "add-relay":
+            cmd_add_relay(arg1, arg2, arg3)
         elif command in {"switch", "sw"}:
             cmd_switch(arg1)
         elif command == "update":
