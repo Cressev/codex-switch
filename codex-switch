@@ -1356,6 +1356,9 @@ def _tui_fetch_one(name: str, state: dict, lock: threading.Lock) -> None:
             if isinstance(rl, dict):
                 result["primary"] = parse_window(rl.get("primary_window"))
                 result["secondary"] = parse_window(rl.get("secondary_window"))
+            api_plan = usage.payload.get("plan_type")
+            if api_plan and isinstance(api_plan, str):
+                result["plan"] = api_plan
         else:
             result["error"] = usage.error_message or "未知错误"
     else:
@@ -1842,14 +1845,14 @@ def print_usage_for_auth(name: str, auth: dict[str, Any], *, is_current: bool = 
     expiry = get_plan_expiry(auth)
     marker = f"{GREEN}*{NC}" if is_current else " "
     prefix = f"{DIM}{seq}.{NC} " if seq else ""
-    label = f"{name} ({plan}" + (f"  至 {expiry}" if expiry else "") + ")" if plan else name
-    print(f"\n{marker} {prefix}{CYAN}▸ {label}{NC}")
     if not token:
+        print(f"\n{marker} {prefix}{CYAN}▸ {name}{NC}")
         print(f"  {RED}无有效 access_token，可能需要重新登录。{NC}")
         return
 
     result = fetch_usage(token)
     if result.payload is None:
+        print(f"\n{marker} {prefix}{CYAN}▸ {name} ({plan}){NC}")
         if result.error_kind == "auth":
             print(f"  {RED}查询失败：当前登录已失效，需要重新登录。{NC}")
         elif result.error_kind in {"network_tls", "network", "timeout"}:
@@ -1860,10 +1863,16 @@ def print_usage_for_auth(name: str, auth: dict[str, Any], *, is_current: bool = 
         return
 
     payload = result.payload
+    api_plan = payload.get("plan_type")
+    if api_plan and isinstance(api_plan, str):
+        plan = api_plan
     rate_limit = payload.get("rate_limit")
     rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
     primary = parse_window(rate_limit.get("primary_window"))
     secondary = parse_window(rate_limit.get("secondary_window"))
+
+    label = f"{name} ({plan}" + (f"  至 {expiry}" if expiry else "") + ")" if plan else name
+    print(f"\n{marker} {prefix}{CYAN}▸ {label}{NC}")
 
     def color_for(used_percent: int | None) -> str:
         if used_percent is None:
