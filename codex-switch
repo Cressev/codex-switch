@@ -569,9 +569,33 @@ def cmd_save(name: str) -> None:
     if not name:
         fail("用法: codex-switch save <name>")
     auth = load_auth()
+    account_id = get_account_id(auth)
     index = read_index()
-    name = resolve_target_name(index, name)
-    account_id = save_snapshot(name, auth)
+
+    existing_by_id = find_account_by_id(index, account_id) if account_id else None
+    if existing_by_id:
+        old_name = str(existing_by_id.get("name"))
+        if old_name == name:
+            save_snapshot(name, auth)
+            print(f"{GREEN}已更新账号 `{name}`。{NC}")
+        else:
+            existing_by_name = find_account(index, name)
+            if existing_by_name:
+                fail(f"名称 `{name}` 已被占用，请换一个名字。")
+            new_auth = load_snapshot(old_name)["auth"]
+            save_snapshot(name, new_auth)
+            delete_snapshot(old_name)
+            index = read_index()
+            index["accounts"] = [a for a in index.get("accounts", []) if a.get("name") != old_name]
+            write_index(index)
+            print(f"{GREEN}已重命名 `{old_name}` -> `{name}`。{NC}")
+        print(f"account_id: {account_id}")
+        return
+
+    existing_by_name = find_account(index, name)
+    if existing_by_name:
+        name = resolve_target_name(index, name)
+    save_snapshot(name, auth)
     print(f"{GREEN}已保存账号 `{name}`。{NC}")
     print(f"account_id: {account_id}")
 
