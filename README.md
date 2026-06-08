@@ -108,11 +108,11 @@ codex-switch <命令> [参数]
   save <name>           保存当前已登录账号到指定名称
   add <name>            登录一个新账号并保存，然后恢复当前登录
   add-relay <name> <auth> <config>  添加中转站账号
-  switch, sw <name|#n>  切换到指定账号
-  update [name|#n]      重新登录并更新指定账号
-  remove, rm <name|#n>  删除账号
-  rename <old|#n> <new> 重命名账号
-  balance, bal [name|#n] 查询额度
+  switch, sw <name|n|#n>  切换到指定账号
+  update [name|n|#n]      重新登录并更新指定账号
+  remove, rm <name|n|#n>  删除账号
+  rename <old|n|#n> <new> 重命名账号
+  balance, bal [name|n|#n] 查询额度
   tui                   交互式 TUI 界面
   doctor, diag          检测 Codex 网络链路
   help                  显示帮助
@@ -141,7 +141,7 @@ codex-switch list
 
 # 按名称或序号切换账号
 codex-switch sw work
-codex-switch sw '#1'
+codex-switch sw 1
 
 # 查询所有账号余额
 codex-switch balance
@@ -152,6 +152,7 @@ codex-switch bal work
 # 重命名 / 删除账号
 codex-switch rename work main
 codex-switch rm old-account
+codex-switch rm 1 2 3
 
 # 打开交互式界面
 codex-switch tui
@@ -168,11 +169,26 @@ codex-switch doctor
 - `save <name>`: 把当前 `~/.codex/auth.json` 保存为指定账号。
 - `add <name>`: 临时运行 `codex login` 添加新账号，完成后恢复原来的登录状态。
 - `add-relay <name> <auth> <config>`: 保存中转账号，切换时会同时写入 `auth.json` 和 `config.toml`。
-- `switch <name|#n>`: 切换账号，`#n` 是 `list` 中显示的序号。
-- `update [name|#n]`: 重新登录并刷新某个账号的 token。
-- `balance [name|#n]`: 查询额度；中转账号会跳过余额查询。
+- `switch <name|n|#n>`: 切换账号，`n` / `#n` 是 `list` 中显示的序号。
+- `update [name|n|#n]`: 重新登录并刷新某个账号的 token。
+- `remove <name|n|#n>`: 删除账号，支持一次删除多个，如 `codex-switch rm 1 2 3`。
+- `balance [name|n|#n]`: 查询额度；中转账号会跳过余额查询。
 - `tui`: 进入交互式界面，支持方向键选择、Enter 切换、`r` 刷新、`d` 诊断、`q` 退出。
 - `doctor`: 检测当前命令行到 Codex 相关接口的网络链路。
+
+Linux / macOS 的 shell 可能会把未加引号的 `#1` 当作注释，因此推荐直接使用裸数字序号：
+
+```bash
+codex-switch sw 1
+codex-switch rm 1 2 3
+```
+
+如果仍想使用 `#1` 写法，需要加引号或转义：
+
+```bash
+codex-switch sw '#1'
+codex-switch rm \#1
+```
 
 ## 依赖
 

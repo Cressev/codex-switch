@@ -91,11 +91,12 @@ def sorted_accounts(index: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(index.get("accounts", []), key=lambda a: str(a.get("name", "")).lower())
 
 def resolve_name(index: dict[str, Any], arg: str) -> str:
-    if arg.startswith("#") and arg[1:].isdigit():
-        pos = int(arg[1:]) - 1
+    seq = arg[1:] if arg.startswith("#") else arg
+    if seq.isdigit():
+        pos = int(seq) - 1
         accounts = sorted_accounts(index)
         if pos < 0 or pos >= len(accounts):
-            fail(f"序号 #{arg[1:]} 超出范围（共 {len(accounts)} 个账号）。")
+            fail(f"序号 {seq} 超出范围（共 {len(accounts)} 个账号）。")
         return str(accounts[pos]["name"])
     return arg
 

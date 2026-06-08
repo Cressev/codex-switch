@@ -24,23 +24,24 @@ def cmd_help() -> None:
     print("  save <name>           保存当前已登录账号到指定名称")
     print("  add <name>            登录一个新账号并保存，然后恢复当前登录")
     print("  add-relay <name> <auth> <config>  添加中转站账号（提供 auth.json 和 config.toml 路径）")
-    print("  switch, sw <name|#n>  切换到指定账号")
-    print("  update [name|#n]      重新登录并更新指定账号")
-    print("  remove, rm <name|#n>  删除账号")
-    print("  rename <old|#n> <new> 重命名账号")
-    print("  balance, bal [name|#n] 查询额度")
+    print("  switch, sw <name|n|#n>  切换到指定账号")
+    print("  update [name|n|#n]      重新登录并更新指定账号")
+    print("  remove, rm <name|n|#n>  删除账号")
+    print("  rename <old|n|#n> <new> 重命名账号")
+    print("  balance, bal [name|n|#n] 查询额度")
     print("  tui                   交互式 TUI 界面（动态额度、切换、刷新）")
     print("  doctor, diag          检测 Codex / compact / usage 网络链路")
     print("  help                  显示帮助")
     print("")
-    print("  #n 表示 ls 中的序号，如 #1 #2")
+    print("  n 或 #n 表示 ls 中的序号，如 1、2、#1、#2；Linux shell 中 #1 需要加引号")
     print("")
     print("示例:")
     print("  codex-switch save work")
     print("  codex-switch add work")
     print("  codex-switch add-relay my-relay ~/relay-auth.json ~/relay-config.toml")
-    print("  codex-switch switch #2")
-    print("  codex-switch balance #1 #3")
+    print("  codex-switch switch 2")
+    print("  codex-switch balance 1 3")
+    print("  codex-switch rm 1 2 3")
     print("  codex-switch doctor")
 
 def cmd_list() -> None:
@@ -197,7 +198,11 @@ def cmd_switch(name: str) -> None:
 
 def cmd_remove(names: list[str]) -> None:
     if not names:
-        fail("用法: codex-switch remove <name|#n> [name|#n ...]")
+        fail(
+            "用法: codex-switch remove <name|n|#n> [name|n|#n ...]\n"
+            "提示：Linux shell 会把未加引号的 #1 当作注释。请使用 `codex-switch rm 1`，"
+            "或写成 `codex-switch rm '#1'`。"
+        )
     index = read_index()
     resolved = [resolve_name(index, n) for n in names]
     for name in resolved:
