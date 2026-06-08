@@ -27,7 +27,36 @@ git switch omini
 
 ### 2. 安装到 PATH
 
-macOS / Linux:
+推荐使用安装向导，它会自动检测系统并安装启动器：
+
+```bash
+python3 install.py
+```
+
+Windows PowerShell:
+
+```powershell
+python .\install.py
+```
+
+安装向导会：
+
+- 自动识别 macOS / Linux / Windows
+- macOS / Linux 默认安装到 `~/.local/bin`
+- Windows 默认安装到 `%USERPROFILE%\bin`
+- 检查 Python 版本和 PATH
+- 在 PATH 未包含安装目录时给出可复制的配置命令
+
+也可以跳过确认或指定安装目录：
+
+```bash
+python3 install.py --yes
+python3 install.py --target /usr/local/bin
+```
+
+### 手动安装
+
+macOS / Linux 可直接软链到 PATH 中的目录：
 
 ```bash
 mkdir -p ~/.local/bin
@@ -47,16 +76,12 @@ macOS Homebrew 用户也可以软链到 `/opt/homebrew/bin`：
 ln -sf "$PWD/codex-switch" /opt/homebrew/bin/codex-switch
 ```
 
-Windows PowerShell:
+Windows PowerShell 可创建一个指向源码目录的启动器：
 
 ```powershell
-git clone https://github.com/Cressev/codex-switch.git
-cd codex-switch
-git switch omini
-
 $target = "$env:USERPROFILE\bin"
 New-Item -ItemType Directory -Force -Path $target | Out-Null
-Copy-Item .\codex-switch .\codex-switch.cmd $target -Force
+Set-Content -Path "$target\codex-switch.cmd" -Value "@echo off`r`npython `"$PWD\codex-switch`" %*`r`n"
 ```
 
 然后把 `%USERPROFILE%\bin` 加到用户 PATH。也可以不安装，直接在仓库目录运行：
@@ -152,7 +177,7 @@ codex-switch doctor
 ## 依赖
 
 - [Codex CLI](https://github.com/openai/codex) — `codex` 命令需已安装
-- Python 3.10+
+- Python 3.9+
 - macOS / Linux TUI 需要 Python `curses`；Windows 没有 `curses` 时可继续使用普通命令。
 
 ## 存储位置
@@ -181,6 +206,7 @@ git switch omini
 ## 项目结构
 
 ```
+install.py                 # 自动检测平台并安装启动器
 codex-switch              # 薄入口，负责导入 package 并运行 main()
 codex_switch/core.py      # 路径、索引、颜色、通用工具
 codex_switch/auth.py      # auth.json 读写和 token/JWT 解析
